@@ -1,0 +1,130 @@
+# The allocator. No controller: the API server runs this CEL at admission time
+# and fills status.allocation with free addresses from this slice's block.
+#
+# Correctness rests on:
+#   1. All allocations for a slice live in ONE object -> etcd resourceVersion CAS
+#      serializes concurrent writers (loser gets 409 and retries).
+#   2. IPs are stored as integers, so the arithmetic is trivial.
+#   3. Release: the mutation REBUILDS status from spec each time (JSONPatch), so a
+#      request removed from spec.request drops out of status.allocation. This is
+#      why it uses JSONPatch (rebuild) rather than ApplyConfiguration (additive).
+#   4. Anti-tamper: prior allocations are read from oldObject (already stored by
+#      the API server), never from the incoming object, and the mutation runs on
+#      every write. So status is a pure function of (oldObject.status, spec) that
+#      the API server always overwrites -- a client cannot forge or pin status.
+#      (The status subresource is off, so RBAC cannot gate status writes; this is
+#      how we make status effectively allocator-owned instead.)
+#
+# It enumerates the block with a bounded offset literal (0..255) to find free
+# addresses, so it can allocate ALL pending requests in one apply and can reuse
+# addresses freed by a release. This supports slices up to /24 (256 addresses);
+# larger slices need a bigger literal (and slices are meant to stay small).
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: ipslice-allocator
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["multinetwork.networking.x-k8s.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  ["CREATE", "UPDATE"]
+      resources:   ["ipslices"]
+  # No matchConditions: the allocator runs on EVERY write and fully rebuilds
+  # /status. The rebuild is idempotent, so running unconditionally is safe, and it
+  # guarantees any status a client tries to submit is unconditionally overwritten
+  # by the allocator's result -> a client cannot forge status.
+  variables:
+  - name: lo          # first usable address (skip the block's network address)
+    expression: "object.spec.sliceSubnet.networkAddress + 1"
+  - name: hi          # last usable address (skip the block's broadcast address)
+    expression: "object.spec.sliceSubnet.networkAddress + object.spec.sliceSubnet.addressSpace - 2"
+  # Prior allocations come from oldObject (the value already stored by the API
+  # server, itself produced by this allocator), NOT from the incoming object. This
+  # is the anti-tamper guarantee: a client's status.allocation is never read, so it
+  # cannot influence the result. oldObject is null on CREATE.
+  - name: existing
+    expression: >-
+      oldObject == null ? [] :
+        ((has(oldObject.status) && has(oldObject.status.allocation))
+          ? oldObject.status.allocation : [])
+  # Keep only allocations whose request is still present -> removals are released.
+  - name: kept
+    expression: >-
+      variables.existing.filter(a,
+        object.spec.request.exists(r, r.name == a.requestName))
+  - name: usedIps
+    expression: "variables.kept.map(a, a.ip)"
+  # Requests still needing an address, in declared order.
+  - name: pending
+    expression: >-
+      object.spec.request.filter(r, !variables.kept.exists(a, a.requestName == r.name))
+  # Bounded index/offset list. Doubles as (a) block offsets to enumerate free
+  # addresses and (b) indices into the pending list.
+  - name: offsets
+    expression: >-
+      [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+       16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+       32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+       48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+       64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+       80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+       96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+       112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+       128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+       144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+       160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+       176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+       192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+       208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+       224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+       240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255]
+  # Free addresses in ascending order: every usable address not already used.
+  - name: freeList
+    expression: >-
+      variables.offsets.map(o, variables.lo + o)
+        .filter(ip, ip <= variables.hi && !(ip in variables.usedIps))
+  mutations:
+  - patchType: JSONPatch
+    jsonPatch:
+      # Rebuild the whole status: kept allocations + one per pending request,
+      # assigning the i-th pending the i-th free address. Replacing /status is
+      # what makes release work (dropped requests simply aren't kept). If there
+      # are more pending than free addresses, the extras stay unallocated and the
+      # CRD schema validation rejects the apply as "slice full".
+      expression: >-
+        [
+          JSONPatch{
+            op: "add",
+            path: "/status",
+            value: Object.status{
+              allocation:
+                variables.kept.map(a, Object.status.allocation{
+                  requestName: a.requestName,
+                  ip: a.ip,
+                  address: a.address
+                })
+                +
+                variables.offsets
+                  .filter(i, i < size(variables.pending) && i < size(variables.freeList))
+                  .map(i, Object.status.allocation{
+                    requestName: variables.pending[i].name,
+                    ip: variables.freeList[i],
+                    address:
+                      string(variables.freeList[i] / 16777216 % 256) + "." +
+                      string(variables.freeList[i] / 65536 % 256) + "." +
+                      string(variables.freeList[i] / 256 % 256) + "." +
+                      string(variables.freeList[i] % 256)
+                  })
+            }
+          }
+        ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: ipslice-allocator-binding
+spec:
+  policyName: ipslice-allocator

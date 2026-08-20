@@ -1,0 +1,47 @@
+# The backstop for the ONE rule the CRD schema cannot express.
+#
+# Everything that fits the CRD's static cost budget lives in the CRD schema
+# (apis/v1alpha1/types.go markers): every request allocated, no orphan
+# allocation, IPs in range, no duplicate IP, and no existing IP changed.
+#
+# The address<->ip consistency check is the exception. Its natural form,
+#   a.address == string(a.ip/16777216%256) + "." + ... ,
+# is rejected by the CRD's STATIC cost estimator: it sizes string(int) by the
+# integer's max VALUE (~4.29e9), not its digit count, so a single call is
+# estimated at >100x the per-rule budget. A ValidatingAdmissionPolicy enforces
+# cost at RUNTIME instead, on the real values (each octet is 0-255), where the
+# cost is trivial -- so the rule can be written in its natural, readable form.
+#
+# Like the CRD rules, this runs after the MutatingAdmissionPolicy has filled
+# status, so it validates the allocator's own output as a defense-in-depth check.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ipslice-address-consistency
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["multinetwork.networking.x-k8s.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  ["CREATE", "UPDATE"]
+      resources:   ["ipslices"]
+  validations:
+  - expression: >-
+      !has(object.status) || !has(object.status.allocation) ||
+      object.status.allocation.all(a,
+        a.address ==
+          string(a.ip / 16777216 % 256) + "." +
+          string(a.ip / 65536 % 256) + "." +
+          string(a.ip / 256 % 256) + "." +
+          string(a.ip % 256))
+    message: "allocation.address does not match allocation.ip"
+    reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ipslice-address-consistency-binding
+spec:
+  policyName: ipslice-address-consistency
+  validationActions: ["Deny"]

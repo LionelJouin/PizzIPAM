@@ -1,0 +1,225 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: ipslices.multinetwork.networking.x-k8s.io
+spec:
+  group: multinetwork.networking.x-k8s.io
+  names:
+    kind: IPSlice
+    listKind: IPSliceList
+    plural: ipslices
+    shortNames:
+    - ipsl
+    singular: ipslice
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: IPSlice describes a slice of IP addresses.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              spec is the desired state of the IPSlice.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+            properties:
+              baseSubnet:
+                description: |-
+                  BaseSubnet is the base subnet for this IP slice.
+                  This field is part of the block identity encoded in the object name; it is immutable.
+                properties:
+                  addressSpace:
+                    description: |-
+                      AddressSpace is the address space of the subnet.
+                      For IPv4, the address space is 2^(32 - prefixLength).
+                      For IPv6, the address space is 2^(128 - prefixLength).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  networkAddress:
+                    description: NetworkAddress is the network address of the subnet.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  prefixLength:
+                    description: PrefixLength is the prefix length of the subnet.
+                    format: int32
+                    maximum: 32
+                    minimum: 0
+                    type: integer
+                required:
+                - addressSpace
+                - networkAddress
+                - prefixLength
+                type: object
+                x-kubernetes-validations:
+                - message: baseSubnet is immutable; create a new IPSlice for a different
+                    block
+                  rule: self == oldSelf
+              podNetworkRef:
+                description: |-
+                  PodNetworkRef identifies the pod network that this IP slice is associated with.
+                  This field is part of the block identity encoded in the object name; it is immutable.
+                properties:
+                  kind:
+                    description: Kind identifies the NetworkKind responsible for the
+                      pod network.
+                    maxLength: 253
+                    type: string
+                  name:
+                    description: Name identifies the pod network object.
+                    maxLength: 253
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace identifies the namespace of the pod network object.
+                      Optional if the pod network object is a non-namespace object.
+                    maxLength: 63
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-validations:
+                - message: podNetworkRef is immutable; create a new IPSlice for a
+                    different block
+                  rule: self == oldSelf
+              request:
+                description: Request is the list of IP requests for this IP slice.
+                items:
+                  properties:
+                    name:
+                      description: Name identifies the request.
+                      maxLength: 63
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              sliceSubnet:
+                description: |-
+                  SliceSubnet is the subnet for this IP slice.
+                  This field is part of the block identity encoded in the object name; it is immutable.
+                properties:
+                  addressSpace:
+                    description: |-
+                      AddressSpace is the address space of the subnet.
+                      For IPv4, the address space is 2^(32 - prefixLength).
+                      For IPv6, the address space is 2^(128 - prefixLength).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  networkAddress:
+                    description: NetworkAddress is the network address of the subnet.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  prefixLength:
+                    description: PrefixLength is the prefix length of the subnet.
+                    format: int32
+                    maximum: 32
+                    minimum: 0
+                    type: integer
+                required:
+                - addressSpace
+                - networkAddress
+                - prefixLength
+                type: object
+                x-kubernetes-validations:
+                - message: sliceSubnet is immutable; create a new IPSlice for a different
+                    block
+                  rule: self == oldSelf
+            required:
+            - baseSubnet
+            - podNetworkRef
+            - sliceSubnet
+            type: object
+          status:
+            description: |-
+              status is the current state of the IPSlice.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+            properties:
+              allocation:
+                description: Allocation is the list of IP allocations for this IP
+                  slice.
+                items:
+                  properties:
+                    address:
+                      description: |-
+                        Address is the allocated IP address in string format.
+                        Max "255.255.255.255" == 15 chars.
+                      maxLength: 15
+                      type: string
+                    ip:
+                      description: |-
+                        IP is the allocated IP address.
+                        Bounded to the IPv4 range so CEL cost estimation of string(ip) stays cheap.
+                      format: int64
+                      maximum: 4294967295
+                      minimum: 0
+                      type: integer
+                    requestName:
+                      description: Name identifies from which request this allocation
+                        was made.
+                      maxLength: 63
+                      type: string
+                  required:
+                  - address
+                  - ip
+                  - requestName
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - requestName
+                x-kubernetes-list-type: map
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: every spec.request must be allocated in status (the slice may be
+            full)
+          rule: '!has(self.spec.request) || self.spec.request.all(r, has(self.status)
+            && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName
+            == r.name))'
+        - message: status.allocation has an entry with no matching spec.request
+          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
+            has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))'
+        - message: an allocated IP is outside the slice usable range
+          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
+            a.ip >= self.spec.sliceSubnet.networkAddress + 1 && a.ip <= self.spec.sliceSubnet.networkAddress
+            + self.spec.sliceSubnet.addressSpace - 2)'
+        - message: duplicate IP in status.allocation
+          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
+            size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)'
+        - message: an existing allocation IP cannot change (only released by removing
+            its request)
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o,
+            !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName))
+            || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a,
+            a.requestName == o.requestName && a.ip == o.ip)))'
+    served: true
+    storage: true
