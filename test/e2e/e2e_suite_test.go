@@ -26,12 +26,15 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	versioned "github.com/lioneljouin/pizzipam/pkg/client/clientset/versioned"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -56,4 +59,17 @@ var _ = BeforeSuite(func() {
 
 	client, err = versioned.NewForConfig(cfg)
 	Expect(err).NotTo(HaveOccurred())
+
+	// A CRD is not necessarily served the instant it is Established: the
+	// apiserver's discovery and RESTMapper can lag by a few seconds, and a write
+	// in that window fails with a 503 ("... there can be a delay between when
+	// CustomResourceDefinitions are created and when they are available"). This
+	// bites a cold cluster (e.g. CI right after `kubectl apply`) but not a warm
+	// one. Wait until a List of the custom resource actually succeeds so the
+	// specs don't race the CRD becoming available.
+	Eventually(func() error {
+		_, err := client.MultinetworkV1alpha1().IPSlices().List(context.Background(), metav1.ListOptions{})
+		return err
+	}).WithTimeout(90*time.Second).WithPolling(time.Second).
+		Should(Succeed(), "the IPSlice CRD never became servable")
 })

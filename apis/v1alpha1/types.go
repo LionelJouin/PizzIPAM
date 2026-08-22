@@ -33,11 +33,21 @@ import (
 // int's max VALUE (~4.29e9) and so estimates it at >100x the budget. That rule
 // lives in the ValidatingAdmissionPolicy instead (deployment/validating-policy.yaml),
 // where cost is enforced at RUNTIME on the real values (octets 0-255) and is cheap.
-// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == r.name))",message="every spec.request must be allocated in status (the slice may be full)"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == r.name))",message="every spec.request must be allocated in status (add new requests one at a time, or the slice is full)"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))",message="status.allocation has an entry with no matching spec.request"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.ip >= self.spec.sliceSubnet.networkAddress + 1 && a.ip <= self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace - 2)",message="an allocated IP is outside the slice usable range"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)",message="duplicate IP in status.allocation"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o, !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName)) || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == o.requestName && a.ip == o.ip)))",message="an existing allocation IP cannot change (only released by removing its request)"
+// A constrained request's subnet must be COMPATIBLE with this slice: one must
+// contain the other (their ranges overlap). A disjoint subnet is rejected. The
+// subnet size is 2^(32-prefixLength), enumerated as a ternary because CEL has no
+// shift/pow. This is pure integer arithmetic, so it fits the CRD cost budget.
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, !has(r.networkAddress) || (r.networkAddress < self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace && self.spec.sliceSubnet.networkAddress < r.networkAddress + (r.prefixLength == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 : r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192 : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ? 262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576 : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7 ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728 : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 : r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 : 4294967296)))",message="a request subnet is disjoint from this slice; the slice and the request subnet must contain one another"
+// Each allocated IP must fall inside its request's subnet (when the request set
+// one). Together with the usable-range rule above, this pins the IP to the
+// (slice AND request) intersection, so a tampered status cannot place an IP
+// outside what was asked for.
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, self.spec.request.exists(r, r.name == a.requestName && (!has(r.networkAddress) || (a.ip >= r.networkAddress && a.ip < r.networkAddress + (r.prefixLength == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 : r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192 : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ? 262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576 : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7 ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728 : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 : r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 : 4294967296)))))",message="an allocated IP is outside its request's subnet"
 
 // IPSlice describes a slice of IP addresses.
 type IPSlice struct {
@@ -126,11 +136,41 @@ type PodNetworkRef struct {
 	Namespace *string `json:"namespace,omitempty"`
 }
 
+// Request asks the allocator for one IP address.
+//
+// By default the IP is taken from anywhere in the slice. A request MAY narrow
+// where the IP comes from by naming a subnet (networkAddress + prefixLength): the
+// allocator then picks a free IP from the intersection of that subnet and this
+// slice. The two fields are set together or not at all, and the subnet must be
+// aligned. The subnet only has to be COMPATIBLE with the slice — one must contain
+// the other (a tighter subnet inside the slice, or a broader subnet that contains
+// it); a disjoint subnet is rejected (see the root "request subnet" rule).
+//
+// +kubebuilder:validation:XValidation:rule="has(self.networkAddress) == has(self.prefixLength)",message="networkAddress and prefixLength must be set together (a request's subnet), or both omitted (allocate from anywhere in the slice)"
+// +kubebuilder:validation:XValidation:rule="!has(self.networkAddress) || self.networkAddress % (self.prefixLength == 32 ? 1 : self.prefixLength == 31 ? 2 : self.prefixLength == 30 ? 4 : self.prefixLength == 29 ? 8 : self.prefixLength == 28 ? 16 : self.prefixLength == 27 ? 32 : self.prefixLength == 26 ? 64 : self.prefixLength == 25 ? 128 : self.prefixLength == 24 ? 256 : self.prefixLength == 23 ? 512 : self.prefixLength == 22 ? 1024 : self.prefixLength == 21 ? 2048 : self.prefixLength == 20 ? 4096 : self.prefixLength == 19 ? 8192 : self.prefixLength == 18 ? 16384 : self.prefixLength == 17 ? 32768 : self.prefixLength == 16 ? 65536 : self.prefixLength == 15 ? 131072 : self.prefixLength == 14 ? 262144 : self.prefixLength == 13 ? 524288 : self.prefixLength == 12 ? 1048576 : self.prefixLength == 11 ? 2097152 : self.prefixLength == 10 ? 4194304 : self.prefixLength == 9 ? 8388608 : self.prefixLength == 8 ? 16777216 : self.prefixLength == 7 ? 33554432 : self.prefixLength == 6 ? 67108864 : self.prefixLength == 5 ? 134217728 : self.prefixLength == 4 ? 268435456 : self.prefixLength == 3 ? 536870912 : self.prefixLength == 2 ? 1073741824 : self.prefixLength == 1 ? 2147483648 : 4294967296) == 0",message="a request's networkAddress must be aligned to its prefixLength (a multiple of the subnet size)"
 type Request struct {
 	// Name identifies the request.
 	// +required
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
+
+	// NetworkAddress is the network address of the subnet to allocate from,
+	// as an integer (int(192.168.0.4) == 3232235524). Optional: set together
+	// with prefixLength to constrain the allocation to a subnet, or omit both
+	// to allocate from anywhere in the slice. Immutable once set.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4294967295
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's networkAddress is immutable; remove the request and add a new one to change its subnet"
+	NetworkAddress *int64 `json:"networkAddress,omitempty"`
+
+	// PrefixLength is the prefix length of the subnet to allocate from.
+	// Optional: set together with networkAddress. Immutable once set.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=32
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's prefixLength is immutable; remove the request and add a new one to change its subnet"
+	PrefixLength *int32 `json:"prefixLength,omitempty"`
 }
 
 type Allocation struct {

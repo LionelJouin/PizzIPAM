@@ -77,14 +77,75 @@ spec:
               request:
                 description: Request is the list of IP requests for this IP slice.
                 items:
+                  description: |-
+                    Request asks the allocator for one IP address.
+
+                    By default the IP is taken from anywhere in the slice. A request MAY narrow
+                    where the IP comes from by naming a subnet (networkAddress + prefixLength): the
+                    allocator then picks a free IP from the intersection of that subnet and this
+                    slice. The two fields are set together or not at all, and the subnet must be
+                    aligned. The subnet only has to be COMPATIBLE with the slice — one must contain
+                    the other (a tighter subnet inside the slice, or a broader subnet that contains
+                    it); a disjoint subnet is rejected (see the root "request subnet" rule).
                   properties:
                     name:
                       description: Name identifies the request.
                       maxLength: 63
                       type: string
+                    networkAddress:
+                      description: |-
+                        NetworkAddress is the network address of the subnet to allocate from,
+                        as an integer (int(192.168.0.4) == 3232235524). Optional: set together
+                        with prefixLength to constrain the allocation to a subnet, or omit both
+                        to allocate from anywhere in the slice. Immutable once set.
+                      format: int64
+                      maximum: 4294967295
+                      minimum: 0
+                      type: integer
+                      x-kubernetes-validations:
+                      - message: a request's networkAddress is immutable; remove the
+                          request and add a new one to change its subnet
+                        rule: self == oldSelf
+                    prefixLength:
+                      description: |-
+                        PrefixLength is the prefix length of the subnet to allocate from.
+                        Optional: set together with networkAddress. Immutable once set.
+                      format: int32
+                      maximum: 32
+                      minimum: 0
+                      type: integer
+                      x-kubernetes-validations:
+                      - message: a request's prefixLength is immutable; remove the
+                          request and add a new one to change its subnet
+                        rule: self == oldSelf
                   required:
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: networkAddress and prefixLength must be set together
+                      (a request's subnet), or both omitted (allocate from anywhere
+                      in the slice)
+                    rule: has(self.networkAddress) == has(self.prefixLength)
+                  - message: a request's networkAddress must be aligned to its prefixLength
+                      (a multiple of the subnet size)
+                    rule: '!has(self.networkAddress) || self.networkAddress % (self.prefixLength
+                      == 32 ? 1 : self.prefixLength == 31 ? 2 : self.prefixLength
+                      == 30 ? 4 : self.prefixLength == 29 ? 8 : self.prefixLength
+                      == 28 ? 16 : self.prefixLength == 27 ? 32 : self.prefixLength
+                      == 26 ? 64 : self.prefixLength == 25 ? 128 : self.prefixLength
+                      == 24 ? 256 : self.prefixLength == 23 ? 512 : self.prefixLength
+                      == 22 ? 1024 : self.prefixLength == 21 ? 2048 : self.prefixLength
+                      == 20 ? 4096 : self.prefixLength == 19 ? 8192 : self.prefixLength
+                      == 18 ? 16384 : self.prefixLength == 17 ? 32768 : self.prefixLength
+                      == 16 ? 65536 : self.prefixLength == 15 ? 131072 : self.prefixLength
+                      == 14 ? 262144 : self.prefixLength == 13 ? 524288 : self.prefixLength
+                      == 12 ? 1048576 : self.prefixLength == 11 ? 2097152 : self.prefixLength
+                      == 10 ? 4194304 : self.prefixLength == 9 ? 8388608 : self.prefixLength
+                      == 8 ? 16777216 : self.prefixLength == 7 ? 33554432 : self.prefixLength
+                      == 6 ? 67108864 : self.prefixLength == 5 ? 134217728 : self.prefixLength
+                      == 4 ? 268435456 : self.prefixLength == 3 ? 536870912 : self.prefixLength
+                      == 2 ? 1073741824 : self.prefixLength == 1 ? 2147483648 : 4294967296)
+                      == 0'
                 maxItems: 64
                 type: array
                 x-kubernetes-list-map-keys:
@@ -191,8 +252,8 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: every spec.request must be allocated in status (the slice may be
-            full)
+        - message: every spec.request must be allocated in status (add new requests
+            one at a time, or the slice is full)
           rule: '!has(self.spec.request) || self.spec.request.all(r, has(self.status)
             && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName
             == r.name))'
@@ -212,5 +273,42 @@ spec:
             !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName))
             || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a,
             a.requestName == o.requestName && a.ip == o.ip)))'
+        - message: a request subnet is disjoint from this slice; the slice and the
+            request subnet must contain one another
+          rule: '!has(self.spec.request) || self.spec.request.all(r, !has(r.networkAddress)
+            || (r.networkAddress < self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace
+            && self.spec.sliceSubnet.networkAddress < r.networkAddress + (r.prefixLength
+            == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength
+            == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength
+            == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 :
+            r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength
+            == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192
+            : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength
+            == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ?
+            262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576
+            : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength
+            == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7
+            ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728
+            : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 :
+            r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 :
+            4294967296)))'
+        - message: an allocated IP is outside its request's subnet
+          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
+            self.spec.request.exists(r, r.name == a.requestName && (!has(r.networkAddress)
+            || (a.ip >= r.networkAddress && a.ip < r.networkAddress + (r.prefixLength
+            == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength
+            == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength
+            == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 :
+            r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength
+            == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192
+            : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength
+            == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ?
+            262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576
+            : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength
+            == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7
+            ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728
+            : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 :
+            r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 :
+            4294967296)))))'
     served: true
     storage: true

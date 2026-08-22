@@ -1,0 +1,11 @@
+# kind cluster for the e2e suite.
+#
+# The allocator is a MutatingAdmissionPolicy. That API is served under
+# admissionregistration.k8s.io/v1 as of its GA (the node image below is pinned to
+# a release that serves it). The feature-gate line is a belt-and-suspenders: on a
+# GA build the gate is locked to true and setting it true is a no-op, but it keeps
+# this config working on a build where the policy API is still gated on.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane

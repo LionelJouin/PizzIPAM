@@ -53,7 +53,6 @@ status:
 | `manifests/mutating-policy.yaml` | the allocator (CEL) |
 | `manifests/validating-policy.yaml` | the correctness backstop |
 | `examples/shard-0.yaml`, `shard-1.yaml` | two `/25` shards of `192.168.0.0/24` |
-| `scripts/ip2int.sh` | helper: IP string -> integer for `spec.baseInt` |
 | `demo.sh` | one-shot end-to-end run |
 
 ## Run
