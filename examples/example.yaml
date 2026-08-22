@@ -4,16 +4,14 @@
 apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
 kind: IPSlice
 metadata:
-  name: blue-network
+  # Canonical, server-enforced name for this identity (see pkg/naming.Name):
+  # <name>.<kind>[.<namespace>].<sliceNet>
+  name: abc.blue-network.3232235520
 spec:
   podNetworkRef:
     name: abc
     kind: blue-network
-  baseSubnet: # 192.168.0.0/24
-    networkAddress: 3232235520
-    prefixLength: 24
-    addressSpace: 256
-  sliceSubnet: # 192.168.0.0/26
+  sliceSubnet: # 192.168.0.0/26 (slice size is a fixed /26)
     networkAddress: 3232235520
     prefixLength: 26
     addressSpace: 64

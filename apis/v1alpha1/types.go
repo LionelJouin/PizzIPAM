@@ -68,16 +68,22 @@ type IPSliceSpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	Request []Request `json:"request,omitempty"`
 
-	// BaseSubnet is the base subnet for this IP slice.
-	// This field is part of the block identity encoded in the object name; it is immutable.
-	// +required
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="baseSubnet is immutable; create a new IPSlice for a different block"
-	BaseSubnet Subnet `json:"baseSubnet"`
-
 	// SliceSubnet is the subnet for this IP slice.
-	// This field is part of the block identity encoded in the object name; it is immutable.
+	//
+	// The slice size is a fixed system-wide constant: every slice is a /26
+	// (prefixLength 26, addressSpace 64). This is what makes the blocks a true
+	// partition — with a fixed size and an aligned networkAddress, every IPv4
+	// address belongs to exactly one slice, so disjointness holds WITHOUT any
+	// cross-object check (rule 2). networkAddress alone (plus podNetworkRef) is
+	// therefore the block identity encoded in the name; it is immutable.
+	//
+	// If you ever change the slice size, change all four in lockstep: the two
+	// constants below, the alignment modulus, and the usable-range root rule.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sliceSubnet is immutable; create a new IPSlice for a different block"
+	// +kubebuilder:validation:XValidation:rule="self.prefixLength == 26",message="slice size is fixed: sliceSubnet.prefixLength must be 26 (a /26)"
+	// +kubebuilder:validation:XValidation:rule="self.addressSpace == 64",message="slice size is fixed: sliceSubnet.addressSpace must be 64 (a /26)"
+	// +kubebuilder:validation:XValidation:rule="self.networkAddress % 64 == 0",message="sliceSubnet.networkAddress must be aligned to the /26 grid (a multiple of 64)"
 	SliceSubnet Subnet `json:"sliceSubnet"`
 }
 
@@ -92,21 +98,31 @@ type IPSliceStatus struct {
 }
 
 // PodNetworkRef identifies a specific pod network instance.
+//
+// Its fields (together with sliceSubnet.networkAddress) form the block identity
+// that the object's metadata.name is derived from and enforced against by the
+// ValidatingAdmissionPolicy. They are therefore constrained to DNS-1123 labels:
+// lowercase, no dots, <=63 chars. That keeps the derived dotted name a valid
+// DNS-1123 subdomain and makes the identity -> name mapping unambiguous (a '.'
+// inside a component could otherwise collide two different identities).
 type PodNetworkRef struct {
 	// Kind identifies the NetworkKind responsible for the pod network.
 	// +required
-	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Kind string `json:"kind"`
 
 	// Name identifies the pod network object.
 	// +required
-	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 
 	// Namespace identifies the namespace of the pod network object.
 	// Optional if the pod network object is a non-namespace object.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Namespace *string `json:"namespace,omitempty"`
 }
 
@@ -139,8 +155,11 @@ type Allocation struct {
 
 type Subnet struct {
 	// NetworkAddress is the network address of the subnet.
+	// Bounded to the IPv4 range; it is part of the block identity encoded in the
+	// object name, so it must stay a bounded, stringifiable integer.
 	// +required
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4294967295
 	NetworkAddress int64 `json:"networkAddress"`
 
 	// PrefixLength is the prefix length of the subnet.

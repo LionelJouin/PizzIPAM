@@ -1,23 +1,20 @@
-# The backstop for the ONE rule the CRD schema cannot express.
+# Backstop for the invariants the CRD schema cannot express.
 #
 # Everything that fits the CRD's static cost budget lives in the CRD schema
-# (apis/v1alpha1/types.go markers): every request allocated, no orphan
-# allocation, IPs in range, no duplicate IP, and no existing IP changed.
+# (apis/v1alpha1/types.go markers). The two checks below cannot: both build a
+# string with string(int), which the CRD's STATIC cost estimator sizes by the
+# integer's max VALUE (~4.29e9) rather than its digit count, blowing the per-rule
+# budget by >100x. A ValidatingAdmissionPolicy enforces cost at RUNTIME instead,
+# on the real values (octets 0-255, small network addresses), where it is trivial.
 #
-# The address<->ip consistency check is the exception. Its natural form,
-#   a.address == string(a.ip/16777216%256) + "." + ... ,
-# is rejected by the CRD's STATIC cost estimator: it sizes string(int) by the
-# integer's max VALUE (~4.29e9), not its digit count, so a single call is
-# estimated at >100x the per-rule budget. A ValidatingAdmissionPolicy enforces
-# cost at RUNTIME instead, on the real values (each octet is 0-255), where the
-# cost is trivial -- so the rule can be written in its natural, readable form.
-#
-# Like the CRD rules, this runs after the MutatingAdmissionPolicy has filled
-# status, so it validates the allocator's own output as a defense-in-depth check.
+# NOTE: this policy replaces the earlier "ipslice-address-consistency" policy. If
+# that one was applied to your cluster, delete it:
+#   kubectl delete validatingadmissionpolicy ipslice-address-consistency
+#   kubectl delete validatingadmissionpolicybinding ipslice-address-consistency-binding
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: ipslice-address-consistency
+  name: ipslice-invariants
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -27,6 +24,23 @@ spec:
       operations:  ["CREATE", "UPDATE"]
       resources:   ["ipslices"]
   validations:
+  # 1. metadata.name MUST be the canonical name for the block identity. This is
+  #    what makes naming server-owned instead of a client contract: each identity
+  #    has exactly one legal name, so a wrong name is denied and a second object
+  #    for the same block collides on create -> never two objects for one block,
+  #    and clients cannot invent names. This CEL MUST match pkg/naming.Name()
+  #    byte-for-byte; change them together.
+  - expression: >-
+      object.metadata.name ==
+        object.spec.podNetworkRef.name + "." +
+        object.spec.podNetworkRef.kind +
+        ((has(object.spec.podNetworkRef.namespace) && object.spec.podNetworkRef.namespace != "")
+          ? "." + object.spec.podNetworkRef.namespace : "") + "." +
+        string(object.spec.sliceSubnet.networkAddress)
+    message: "metadata.name must be the canonical name for this block's identity (see pkg/naming.Name); it is derived, not chosen"
+    reason: Invalid
+  # 2. status.address must be the dotted-decimal form of status.ip. Defense in
+  #    depth: the allocator writes both, so this catches any bypass of the MAP.
   - expression: >-
       !has(object.status) || !has(object.status.allocation) ||
       object.status.allocation.all(a,
@@ -41,7 +55,7 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: ipslice-address-consistency-binding
+  name: ipslice-invariants-binding
 spec:
-  policyName: ipslice-address-consistency
+  policyName: ipslice-invariants
   validationActions: ["Deny"]

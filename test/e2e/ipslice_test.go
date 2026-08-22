@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
+	"github.com/lioneljouin/pizzipam/pkg/naming"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -45,14 +46,16 @@ var _ = Describe("IPSlice allocation", func() {
 	})
 
 	It("allocates an IP for every request at admission time, with no controller", func(ctx SpecContext) {
+		spec := v1alpha1.IPSliceSpec{
+			PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
+			SliceSubnet:   v1alpha1.Subnet{NetworkAddress: networkAddress, PrefixLength: 26, AddressSpace: int32(sliceAddresses)},
+			Request:       []v1alpha1.Request{{Name: "alpha"}, {Name: "beta"}},
+		}
+		// The name is server-enforced: it MUST be naming.Name(spec) or the
+		// ValidatingAdmissionPolicy denies the create. GenerateName would fail.
 		slice := &v1alpha1.IPSlice{
-			ObjectMeta: metav1.ObjectMeta{GenerateName: "e2e-ipslice-"},
-			Spec: v1alpha1.IPSliceSpec{
-				PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
-				BaseSubnet:    v1alpha1.Subnet{NetworkAddress: networkAddress, PrefixLength: 24, AddressSpace: 256},
-				SliceSubnet:   v1alpha1.Subnet{NetworkAddress: networkAddress, PrefixLength: 26, AddressSpace: int32(sliceAddresses)},
-				Request:       []v1alpha1.Request{{Name: "alpha"}, {Name: "beta"}},
-			},
+			ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)},
+			Spec:       spec,
 		}
 
 		By("creating the IPSlice")
