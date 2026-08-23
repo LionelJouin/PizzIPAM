@@ -30,7 +30,7 @@ limitations under the License.
 //
 // Usage (needs a cluster with ./deployment applied, like the e2e suite):
 //
-//	go run ./test/bench                 # baseline x20, fill a full /26 (62)
+//	go run ./test/bench                 # baseline x20, fill a full /26 (64)
 //	go run ./test/bench -fill 30 -baseline-samples 50
 //	go run ./test/bench -keep           # don't delete the objects afterwards
 package main
@@ -79,7 +79,7 @@ const (
 
 func main() {
 	var (
-		fill            = flag.Int("fill", 62, "number of requests to add one at a time (a /26 has 62 usable)")
+		fill            = flag.Int("fill", 64, "number of requests to add one at a time (a /26 has 64 allocatable)")
 		baselineSamples = flag.Int("baseline-samples", 20, "how many empty IPSlices to create for the baseline")
 		keep            = flag.Bool("keep", false, "do not delete the created IPSlices at the end")
 		qps             = flag.Float64("qps", 1000, "client-go REST QPS; the DEFAULT of 5 throttles to ~200ms/request and hides the real admission latency. Keep high to measure the server.")

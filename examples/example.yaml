@@ -1,4 +1,4 @@
-# This slice owns 192.168.0.0/26  (usable .1 - .62)
+# This slice owns 192.168.0.0/26  (all 64 allocatable: .0 - .63)
 # networkAddress = int(192.168.0.0) = 3232235520
 # Compute with:  IFS=. read -r a b c d <<< "192.168.0.0"; echo $(( (a<<24)+(b<<16)+(c<<8)+d ))
 apiVersion: multinetwork.networking.x-k8s.io/v1alpha1

@@ -30,10 +30,10 @@ import (
 const (
 	// networkAddress is int(192.168.0.0); the slice is a /26 (192.168.0.0/26).
 	networkAddress = int64(3232235520)
-	sliceAddresses = int32(64) // /26 -> 62 usable (.1 - .62)
+	sliceAddresses = int32(64) // /26 -> all 64 allocatable (.0 - .63)
 
-	lo = networkAddress + 1                         // first usable address
-	hi = networkAddress + int64(sliceAddresses) - 2 // last usable address
+	lo = networkAddress                             // first allocatable address (network address included)
+	hi = networkAddress + int64(sliceAddresses) - 1 // last allocatable address (broadcast included)
 )
 
 func i64(v int64) *int64 { return &v }
@@ -195,11 +195,12 @@ var _ = Describe("IPSlice allocation", func() {
 	})
 
 	It("fills every usable address, rejects when full, then re-accepts after a release", func(ctx SpecContext) {
-		// A /26 has 62 usable addresses (.1 - .62). Add requests one per write
-		// (the allocator serves one new request per pass) until the slice is full,
-		// a further request must be rejected, and then removing a request must free
-		// its IP so the slice accepts a new request again (full is not permanent).
-		usable := int(hi - lo + 1) // 62
+		// A /26 has 64 allocatable addresses (.0 - .63; network and broadcast
+		// included). Add requests one per write (the allocator serves one new
+		// request per pass) until the slice is full, a further request must be
+		// rejected, and then removing a request must free its IP so the slice
+		// accepts a new request again (full is not permanent).
+		usable := int(hi - lo + 1) // 64
 
 		By("creating with the first request")
 		var err error

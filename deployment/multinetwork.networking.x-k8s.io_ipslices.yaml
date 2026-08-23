@@ -16,7 +16,28 @@ spec:
     singular: ipslice
   scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.podNetworkRef.name
+      name: Network
+      type: string
+    - jsonPath: .spec.podNetworkRef.kind
+      name: Kind
+      type: string
+    - jsonPath: .spec.podNetworkRef.namespace
+      name: Namespace
+      priority: 1
+      type: string
+    - jsonPath: .spec.sliceSubnet.networkAddress
+      name: NetworkAddress
+      type: integer
+    - jsonPath: .spec.sliceSubnet.prefixLength
+      name: Prefix
+      priority: 1
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: IPSlice describes a slice of IP addresses.
@@ -260,10 +281,10 @@ spec:
         - message: status.allocation has an entry with no matching spec.request
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
             has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))'
-        - message: an allocated IP is outside the slice usable range
+        - message: an allocated IP is outside the slice range
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            a.ip >= self.spec.sliceSubnet.networkAddress + 1 && a.ip <= self.spec.sliceSubnet.networkAddress
-            + self.spec.sliceSubnet.addressSpace - 2)'
+            a.ip >= self.spec.sliceSubnet.networkAddress && a.ip <= self.spec.sliceSubnet.networkAddress
+            + self.spec.sliceSubnet.addressSpace - 1)'
         - message: duplicate IP in status.allocation
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
             size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)'
@@ -312,3 +333,4 @@ spec:
             4294967296)))))'
     served: true
     storage: true
+    subresources: {}

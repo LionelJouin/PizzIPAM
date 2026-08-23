@@ -30,7 +30,7 @@ spec:
 EOF
 ```
 
-```sh
+```yaml
 kubectl apply -o yaml --server-side --field-manager=request-0 -f - <<'EOF'
 apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
 kind: IPSlice
@@ -44,7 +44,7 @@ spec:
 EOF
 ```
 
-```sh
+```yaml
 kubectl apply -o yaml --server-side --field-manager=request-1 -f - <<'EOF'
 apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
 kind: IPSlice
@@ -58,7 +58,7 @@ spec:
 EOF
 ```
 
-```sh
+```yaml
 kubectl apply -o yaml --server-side --field-manager=request-0 -f - <<'EOF'
 apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
 kind: IPSlice

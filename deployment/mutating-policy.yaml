@@ -43,10 +43,10 @@ spec:
   # guarantees any status a client tries to submit is unconditionally overwritten
   # by the allocator's result -> a client cannot forge status.
   variables:
-  - name: lo          # first usable address (skip the block's network address)
-    expression: "object.spec.sliceSubnet.networkAddress + 1"
-  - name: hi          # last usable address (skip the block's broadcast address)
-    expression: "object.spec.sliceSubnet.networkAddress + object.spec.sliceSubnet.addressSpace - 2"
+  - name: lo          # first allocatable address (the block's network address is allocatable)
+    expression: "object.spec.sliceSubnet.networkAddress"
+  - name: hi          # last allocatable address (the block's broadcast address is allocatable)
+    expression: "object.spec.sliceSubnet.networkAddress + object.spec.sliceSubnet.addressSpace - 1"
   # Prior allocations come from oldObject (the value already stored by the API
   # server, itself produced by this allocator), NOT from the incoming object. This
   # is the anti-tamper guarantee: a client's status.allocation is never read, so it

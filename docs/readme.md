@@ -69,7 +69,8 @@ one of them is load-bearing.
    everything for a block is in one object.
 
 4. **Slice size is a fixed, small constant (`maxItems` caps the lists).** Every
-   slice is a `/26` (`addressSpace 64`, 62 usable) — the schema pins
+   slice is a `/26` (`addressSpace 64`, all 64 allocatable — network and
+   broadcast addresses included) — the schema pins
    `sliceSubnet.prefixLength == 26` and `addressSpace == 64` so the size can't vary
    (rule 2 depends on it), and `request`/`allocation` are capped by `maxItems 64`.
    The object stays far under etcd's ~1.5 MiB limit and the CEL enumeration is cheap

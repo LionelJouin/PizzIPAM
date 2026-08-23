@@ -23,6 +23,12 @@ import (
 // +genclient
 // +genclient:nonNamespaced
 // +kubebuilder:resource:shortName=ipsl,scope=Cluster
+// +kubebuilder:printcolumn:name="Network",type=string,JSONPath=`.spec.podNetworkRef.name`
+// +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.podNetworkRef.kind`
+// +kubebuilder:printcolumn:name="Namespace",type=string,JSONPath=`.spec.podNetworkRef.namespace`,priority=1
+// +kubebuilder:printcolumn:name="NetworkAddress",type=integer,JSONPath=`.spec.sliceSubnet.networkAddress`
+// +kubebuilder:printcolumn:name="Prefix",type=integer,JSONPath=`.spec.sliceSubnet.prefixLength`,priority=1
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // Object-level validations (cross-field spec<->status). These run at schema
 // validation time, after the MutatingAdmissionPolicy has filled status.
@@ -35,7 +41,7 @@ import (
 // where cost is enforced at RUNTIME on the real values (octets 0-255) and is cheap.
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == r.name))",message="every spec.request must be allocated in status (add new requests one at a time, or the slice is full)"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))",message="status.allocation has an entry with no matching spec.request"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.ip >= self.spec.sliceSubnet.networkAddress + 1 && a.ip <= self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace - 2)",message="an allocated IP is outside the slice usable range"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.ip >= self.spec.sliceSubnet.networkAddress && a.ip <= self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace - 1)",message="an allocated IP is outside the slice range"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)",message="duplicate IP in status.allocation"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o, !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName)) || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == o.requestName && a.ip == o.ip)))",message="an existing allocation IP cannot change (only released by removing its request)"
 // A constrained request's subnet must be COMPATIBLE with this slice: one must
