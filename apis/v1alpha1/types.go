@@ -26,34 +26,34 @@ import (
 // +kubebuilder:printcolumn:name="Network",type=string,JSONPath=`.spec.podNetworkRef.name`
 // +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.podNetworkRef.kind`
 // +kubebuilder:printcolumn:name="Namespace",type=string,JSONPath=`.spec.podNetworkRef.namespace`,priority=1
-// +kubebuilder:printcolumn:name="NetworkAddress",type=integer,JSONPath=`.spec.sliceSubnet.networkAddress`
-// +kubebuilder:printcolumn:name="Prefix",type=integer,JSONPath=`.spec.sliceSubnet.prefixLength`,priority=1
+// +kubebuilder:printcolumn:name="Family",type=string,JSONPath=`.spec.sliceSubnet.family`
+// +kubebuilder:printcolumn:name="Prefix",type=string,JSONPath=`.spec.sliceSubnet.prefix`
+// +kubebuilder:printcolumn:name="PrefixLength",type=integer,JSONPath=`.spec.sliceSubnet.prefixLength`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // Object-level validations (cross-field spec<->status). These run at schema
 // validation time, after the MutatingAdmissionPolicy has filled status.
 //
-// Everything expressible cheaply in the CRD lives here. The one exception is the
-// address<->ip consistency check: its natural form (a.address == string(a.ip...))
-// is rejected by the CRD's STATIC cost estimator, which sizes string(int) by the
-// int's max VALUE (~4.29e9) and so estimates it at >100x the budget. That rule
-// lives in the ValidatingAdmissionPolicy instead (deployment/validating-policy.yaml),
-// where cost is enforced at RUNTIME on the real values (octets 0-255) and is cheap.
+// The allocator reasons entirely in host OFFSETS (0 .. 63), which are small
+// integers that fit CEL's int64 for EVERY address family (IPv4 and IPv6).
+// The network is an opaque canonical `prefix` STRING that CEL never does math on;
+// the IP/CIDR CEL libraries (isIP, ip.isCanonical, family, cidr().masked()) check
+// it cheaply. This is why the whole thing works for IPv6 despite CEL being 64-bit:
+// nothing here ever holds a 128-bit address.
+//
+// 1. every request is allocated; 2. no orphan allocation; 3. offset in range;
+// 4. no duplicate offset; 5. an existing offset never changes (release-only);
+// 6. a constrained request's window fits inside the slice; 7. each allocation's
+// offset lies inside its request's window. Rules 6-7 replace the old
+// 2^(32-prefix) ternary and disjoint-subnet check entirely -- an offset window is
+// expressed in slice offsets, so it cannot be disjoint from the slice.
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == r.name))",message="every spec.request must be allocated in status (add new requests one at a time, or the slice is full)"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))",message="status.allocation has an entry with no matching spec.request"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.ip >= self.spec.sliceSubnet.networkAddress && a.ip <= self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace - 1)",message="an allocated IP is outside the slice range"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)",message="duplicate IP in status.allocation"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o, !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName)) || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == o.requestName && a.ip == o.ip)))",message="an existing allocation IP cannot change (only released by removing its request)"
-// A constrained request's subnet must be COMPATIBLE with this slice: one must
-// contain the other (their ranges overlap). A disjoint subnet is rejected. The
-// subnet size is 2^(32-prefixLength), enumerated as a ternary because CEL has no
-// shift/pow. This is pure integer arithmetic, so it fits the CRD cost budget.
-// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, !has(r.networkAddress) || (r.networkAddress < self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace && self.spec.sliceSubnet.networkAddress < r.networkAddress + (r.prefixLength == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 : r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192 : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ? 262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576 : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7 ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728 : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 : r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 : 4294967296)))",message="a request subnet is disjoint from this slice; the slice and the request subnet must contain one another"
-// Each allocated IP must fall inside its request's subnet (when the request set
-// one). Together with the usable-range rule above, this pins the IP to the
-// (slice AND request) intersection, so a tampered status cannot place an IP
-// outside what was asked for.
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, self.spec.request.exists(r, r.name == a.requestName && (!has(r.networkAddress) || (a.ip >= r.networkAddress && a.ip < r.networkAddress + (r.prefixLength == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 : r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192 : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ? 262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576 : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7 ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728 : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 : r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 : 4294967296)))))",message="an allocated IP is outside its request's subnet"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.offset >= 0 && a.offset < 64)",message="an allocated offset is outside the slice range"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, size(self.status.allocation.filter(x, x.offset == a.offset)) == 1)",message="duplicate offset in status.allocation"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o, !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName)) || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == o.requestName && a.offset == o.offset)))",message="an existing allocation offset cannot change (only released by removing its request)"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, !has(r.offset) || r.offset + r.length <= 64)",message="a request's offset window must fit inside the slice (offset + length <= 64)"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, self.spec.request.exists(r, r.name == a.requestName && (!has(r.offset) || (a.offset >= r.offset && a.offset < r.offset + r.length))))",message="an allocated offset is outside its request's window"
 
 // IPSlice describes a slice of IP addresses.
 type IPSlice struct {
@@ -86,20 +86,36 @@ type IPSliceSpec struct {
 
 	// SliceSubnet is the subnet for this IP slice.
 	//
-	// The slice size is a fixed system-wide constant: every slice is a /26
-	// (prefixLength 26, addressSpace 64). This is what makes the blocks a true
-	// partition — with a fixed size and an aligned networkAddress, every IPv4
-	// address belongs to exactly one slice, so disjointness holds WITHOUT any
-	// cross-object check (rule 2). networkAddress alone (plus podNetworkRef) is
-	// therefore the block identity encoded in the name; it is immutable.
+	// The slice size is a fixed system-wide constant: every slice holds 64
+	// addresses -- a /26 for IPv4, a /122 for IPv6. The size is not a field: it is
+	// implied by the pinned prefixLength (below) and baked into the offset bounds
+	// (0..63) as literals. This is what makes the blocks a true partition: with a
+	// fixed size and a network-aligned prefix, every address belongs to exactly one
+	// slice, so disjointness holds WITHOUT any cross-object check (rule 2). The
+	// prefix (plus podNetworkRef) is the block identity encoded in the name; the
+	// whole subnet is immutable.
 	//
-	// If you ever change the slice size, change all four in lockstep: the two
-	// constants below, the alignment modulus, and the usable-range root rule.
+	// Uniqueness across families relies on the prefix being CANONICAL: unlike an
+	// integer, a text IP has many spellings for one network. ip.isCanonical()
+	// enforces the single canonical form in CEL, so a canonical prefix maps to
+	// exactly one name (see pkg/naming.Name and the VAP).
+	//
+	// If you ever change the slice size, change these in lockstep: the pinned
+	// prefixLengths, the offset bounds (0..63 on Request/Allocation and the "< 64"
+	// root rules), and MaxItems on the lists.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sliceSubnet is immutable; create a new IPSlice for a different block"
-	// +kubebuilder:validation:XValidation:rule="self.prefixLength == 26",message="slice size is fixed: sliceSubnet.prefixLength must be 26 (a /26)"
-	// +kubebuilder:validation:XValidation:rule="self.addressSpace == 64",message="slice size is fixed: sliceSubnet.addressSpace must be 64 (a /26)"
-	// +kubebuilder:validation:XValidation:rule="self.networkAddress % 64 == 0",message="sliceSubnet.networkAddress must be aligned to the /26 grid (a multiple of 64)"
+	// +kubebuilder:validation:XValidation:rule="isIP(self.prefix)",message="sliceSubnet.prefix must be a valid IP address"
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip.isCanonical(self.prefix)",message="sliceSubnet.prefix must be in canonical form (e.g. lowercase, compressed IPv6)"
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip(self.prefix).family() == (self.family == 'IPv4' ? 4 : 6)",message="sliceSubnet.prefix family must match sliceSubnet.family"
+	// +kubebuilder:validation:XValidation:rule="self.family == 'IPv4' ? self.prefixLength == 26 : self.prefixLength == 122",message="slice size is fixed: prefixLength must be 26 for IPv4 or 122 for IPv6 (both are 64 addresses)"
+	// The prefix length is a family-branched string LITERAL ('/26' or '/122'), not
+	// string(self.prefixLength): the CRD's static cost estimator sizes string(int)
+	// by the integer's max magnitude, which inflates the concatenated CIDR string
+	// and pushes this rule >100x over budget. prefixLength is already pinned per
+	// family (rule above), so the literal is exact and keeps the check in the CRD
+	// (where it always runs and can't be unbound) instead of a VAP.
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || string(cidr(self.prefix + (self.family == 'IPv4' ? '/26' : '/122')).masked().ip()) == self.prefix",message="sliceSubnet.prefix must be the network address (host bits zero) aligned to prefixLength"
 	SliceSubnet Subnet `json:"sliceSubnet"`
 }
 
@@ -144,39 +160,40 @@ type PodNetworkRef struct {
 
 // Request asks the allocator for one IP address.
 //
-// By default the IP is taken from anywhere in the slice. A request MAY narrow
-// where the IP comes from by naming a subnet (networkAddress + prefixLength): the
-// allocator then picks a free IP from the intersection of that subnet and this
-// slice. The two fields are set together or not at all, and the subnet must be
-// aligned. The subnet only has to be COMPATIBLE with the slice — one must contain
-// the other (a tighter subnet inside the slice, or a broader subnet that contains
-// it); a disjoint subnet is rejected (see the root "request subnet" rule).
+// By default the address is taken from anywhere in the slice. A request MAY narrow
+// where it comes from with an OFFSET WINDOW: offset (the first host offset within
+// the slice) plus length (the number of addresses). The allocator then picks the
+// lowest free offset in [offset, offset+length-1]. The two fields are set together
+// or not at all; the window must be aligned (offset % length == 0), a power of two
+// in size, and fit inside the slice (checked by the root rules). Offsets are
+// family-agnostic small integers, so this works identically for IPv4 and IPv6.
 //
-// +kubebuilder:validation:XValidation:rule="has(self.networkAddress) == has(self.prefixLength)",message="networkAddress and prefixLength must be set together (a request's subnet), or both omitted (allocate from anywhere in the slice)"
-// +kubebuilder:validation:XValidation:rule="!has(self.networkAddress) || self.networkAddress % (self.prefixLength == 32 ? 1 : self.prefixLength == 31 ? 2 : self.prefixLength == 30 ? 4 : self.prefixLength == 29 ? 8 : self.prefixLength == 28 ? 16 : self.prefixLength == 27 ? 32 : self.prefixLength == 26 ? 64 : self.prefixLength == 25 ? 128 : self.prefixLength == 24 ? 256 : self.prefixLength == 23 ? 512 : self.prefixLength == 22 ? 1024 : self.prefixLength == 21 ? 2048 : self.prefixLength == 20 ? 4096 : self.prefixLength == 19 ? 8192 : self.prefixLength == 18 ? 16384 : self.prefixLength == 17 ? 32768 : self.prefixLength == 16 ? 65536 : self.prefixLength == 15 ? 131072 : self.prefixLength == 14 ? 262144 : self.prefixLength == 13 ? 524288 : self.prefixLength == 12 ? 1048576 : self.prefixLength == 11 ? 2097152 : self.prefixLength == 10 ? 4194304 : self.prefixLength == 9 ? 8388608 : self.prefixLength == 8 ? 16777216 : self.prefixLength == 7 ? 33554432 : self.prefixLength == 6 ? 67108864 : self.prefixLength == 5 ? 134217728 : self.prefixLength == 4 ? 268435456 : self.prefixLength == 3 ? 536870912 : self.prefixLength == 2 ? 1073741824 : self.prefixLength == 1 ? 2147483648 : 4294967296) == 0",message="a request's networkAddress must be aligned to its prefixLength (a multiple of the subnet size)"
+// +kubebuilder:validation:XValidation:rule="has(self.offset) == has(self.length)",message="offset and length must be set together (a request's window), or both omitted (allocate from anywhere in the slice)"
+// +kubebuilder:validation:XValidation:rule="!has(self.offset) || self.offset % self.length == 0",message="a request's offset must be aligned to its length (a multiple of the window size)"
+// +kubebuilder:validation:XValidation:rule="!has(self.length) || (self.length == 1 || self.length == 2 || self.length == 4 || self.length == 8 || self.length == 16 || self.length == 32 || self.length == 64)",message="a request's length must be a power of two (1, 2, 4, 8, 16, 32 or 64)"
 type Request struct {
 	// Name identifies the request.
 	// +required
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
-	// NetworkAddress is the network address of the subnet to allocate from,
-	// as an integer (int(192.168.0.4) == 3232235524). Optional: set together
-	// with prefixLength to constrain the allocation to a subnet, or omit both
-	// to allocate from anywhere in the slice. Immutable once set.
+	// Offset is the first host offset (within the slice) of the window to allocate
+	// from, 0 .. 63. Optional: set together with length to constrain
+	// the allocation to a window, or omit both to allocate from anywhere in the
+	// slice. Immutable once set.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=4294967295
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's networkAddress is immutable; remove the request and add a new one to change its subnet"
-	NetworkAddress *int64 `json:"networkAddress,omitempty"`
+	// +kubebuilder:validation:Maximum=63
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's offset is immutable; remove the request and add a new one to change its window"
+	Offset *int32 `json:"offset,omitempty"`
 
-	// PrefixLength is the prefix length of the subnet to allocate from.
-	// Optional: set together with networkAddress. Immutable once set.
+	// Length is the size of the window to allocate from (a power of two).
+	// Optional: set together with offset. Immutable once set.
 	// +optional
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=32
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's prefixLength is immutable; remove the request and add a new one to change its subnet"
-	PrefixLength *int32 `json:"prefixLength,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=64
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's length is immutable; remove the request and add a new one to change its window"
+	Length *int32 `json:"length,omitempty"`
 }
 
 type Allocation struct {
@@ -185,41 +202,46 @@ type Allocation struct {
 	// +kubebuilder:validation:MaxLength=63
 	RequestName string `json:"requestName"`
 
-	// IP is the allocated IP address.
-	// Bounded to the IPv4 range so CEL cost estimation of string(ip) stays cheap.
+	// Offset is the allocated host offset within the slice, 0 .. 63.
+	// This is the load-bearing value: the concrete address is (prefix + offset).
 	// +required
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=4294967295
-	IP int64 `json:"ip"`
+	// +kubebuilder:validation:Maximum=63
+	Offset int32 `json:"offset"`
 
-	// Address is the allocated IP address in string format.
-	// Max "255.255.255.255" == 15 chars.
-	// +required
-	// +kubebuilder:validation:MaxLength=15
-	Address string `json:"address"`
+	// Address is the allocated IP address in string format, rendered by the
+	// allocator. It is set for IPv4 (which CEL can render from prefix + offset with
+	// exact integer arithmetic) and omitted for IPv6 (which CEL cannot render:
+	// there is no 128-bit arithmetic). For IPv6, consumers derive the address from
+	// the slice prefix and this offset. Max IPv6 text length is 45 chars.
+	// +optional
+	// +kubebuilder:validation:MaxLength=45
+	Address string `json:"address,omitempty"`
 }
 
 type Subnet struct {
-	// NetworkAddress is the network address of the subnet.
-	// Bounded to the IPv4 range; it is part of the block identity encoded in the
-	// object name, so it must stay a bounded, stringifiable integer.
+	// Family is the IP family of the slice: "IPv4" or "IPv6".
 	// +required
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=4294967295
-	NetworkAddress int64 `json:"networkAddress"`
+	// +kubebuilder:validation:Enum=IPv4;IPv6
+	Family string `json:"family"`
 
-	// PrefixLength is the prefix length of the subnet.
+	// Prefix is the network address of the subnet, as a canonical IP string
+	// (e.g. "192.168.0.0" or "fe80::"). It is part of the block identity encoded in
+	// the object name. CEL does no arithmetic on it; the IP/CIDR CEL libraries
+	// validate it. Must be canonical (ip.isCanonical) so the identity -> name
+	// mapping is unambiguous. Max IPv6 text length is 45 chars.
+	// +required
+	// +kubebuilder:validation:MaxLength=45
+	Prefix string `json:"prefix"`
+
+	// PrefixLength is the prefix length of the subnet: 26 for IPv4, 122 for IPv6
+	// (both cover 64 addresses). This is what fixes the slice size; there is no
+	// separate addressSpace field (the size is implied and baked into the offset
+	// bounds 0..63).
 	// +required
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=32
+	// +kubebuilder:validation:Maximum=128
 	PrefixLength int32 `json:"prefixLength"`
-
-	// AddressSpace is the address space of the subnet.
-	// For IPv4, the address space is 2^(32 - prefixLength).
-	// For IPv6, the address space is 2^(128 - prefixLength).
-	// +required
-	// +kubebuilder:validation:Minimum=1
-	AddressSpace int32 `json:"addressSpace"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

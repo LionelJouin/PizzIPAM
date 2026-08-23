@@ -1,0 +1,162 @@
+# SPIKE — NOT WIRED INTO deployment/. A proposed rewrite of the allocator for a
+# FAMILY-AGNOSTIC, offset-based model that supports both IPv4 and IPv6. See
+# README.md in this directory for the design and the honest list of limitations.
+#
+# The core idea: the allocator only ever reasons about a host OFFSET (0..space-1)
+# within the slice. An offset is always small (0..63 for a /26 or /122), so it is
+# int64-safe for EVERY address family — CEL never has to hold a 128-bit IPv6
+# address or a uint64. The network itself is an opaque `prefix` STRING that CEL
+# does no math on. The only family-specific step is RENDERING the display address
+# from (prefix, offset), and even that is a cheap string op.
+#
+# What is IDENTICAL to the live IPv4 policy:
+#   - one new allocation per write (CEL has no fold/reduce)
+#   - status rebuilt from oldObject every write (anti-tamper, release-on-remove)
+#   - JSONPatch add /status
+#
+# What CHANGED vs the live policy:
+#   - the load-bearing number is `offset` (0..space-1), not the absolute `ip`
+#   - a request narrows with (offset, length) instead of (networkAddress,
+#     prefixLength) — a family-agnostic range that DELETES the 33-branch
+#     2^(32-prefix) ternary entirely (offset math needs no power-of-two table
+#     beyond the request's own `length`, which the client already supplies)
+#   - address rendering branches on spec.sliceSubnet.family
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: ipslice-allocator
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["multinetwork.networking.x-k8s.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  ["CREATE", "UPDATE"]
+      resources:   ["ipslices"]
+  variables:
+  - name: space       # number of host offsets in the slice (64 for a /26 or /122)
+    expression: "object.spec.sliceSubnet.addressSpace"
+  # Prior allocations from oldObject only (never the incoming object) — the
+  # anti-tamper guarantee, unchanged. oldObject is null on CREATE.
+  - name: existing
+    expression: >-
+      oldObject == null ? [] :
+        ((has(oldObject.status) && has(oldObject.status.allocation))
+          ? oldObject.status.allocation : [])
+  - name: requests
+    expression: "has(object.spec.request) ? object.spec.request : []"
+  - name: kept
+    expression: >-
+      variables.existing.filter(a,
+        variables.requests.exists(r, r.name == a.requestName))
+  # The load-bearing set is now OFFSETS, not absolute IPs.
+  - name: usedOffsets
+    expression: "variables.kept.map(a, a.offset)"
+  - name: pending
+    expression: >-
+      variables.requests.filter(r, !variables.kept.exists(a, a.requestName == r.name))
+  - name: have
+    expression: "size(variables.pending) > 0"
+  # Did the first pending request narrow to a sub-range of the slice?
+  - name: constrained
+    expression: "variables.have && has(variables.pending[0].offset)"
+  # Allocation window as an OFFSET range [wlo, whi] within the slice. No subnet
+  # size table needed: the client passes `length` directly, and the CRD checks it
+  # is a power of two and aligned. This is the whole payoff of the offset model —
+  # the 33-branch 2^(32-prefix) ternary is gone.
+  - name: wlo
+    expression: "variables.constrained ? variables.pending[0].offset : 0"
+  - name: whi
+    expression: >-
+      variables.constrained
+        ? variables.pending[0].offset + variables.pending[0].length - 1
+        : variables.space - 1
+  # Bounded offset list — sized to the max slice (a /26 or /122 is 64; the list
+  # goes to 255 to leave headroom for a future larger fixed size, as the live
+  # policy does).
+  - name: offsets
+    expression: >-
+      [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+       16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+       32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+       48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+       64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+       80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+       96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+       112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+       128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+       144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+       160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+       176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+       192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+       208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+       224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+       240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255]
+  - name: freeList
+    expression: >-
+      variables.offsets.filter(o,
+        o >= variables.wlo && o <= variables.whi && o < variables.space
+        && !(o in variables.usedOffsets))
+  - name: pick       # the offset we will assign (guarded by size(freeList) > 0 below)
+    expression: "size(variables.freeList) > 0 ? variables.freeList[0] : 0"
+  # ---- address rendering: the ONLY family-specific step -------------------------
+  - name: family
+    expression: "object.spec.sliceSubnet.family"
+  # IPv4: prefix is dotted ("192.168.0.0"). A fixed /26 is aligned, so the last
+  # octet is a multiple of 64 and (lastOctet + pick) never carries past 255 —
+  # exact integer arithmetic on 0..255, cheap at runtime.
+  - name: v4parts
+    expression: "object.spec.sliceSubnet.prefix.split('.')"
+  - name: v4addr
+    expression: >-
+      variables.v4parts[0] + "." + variables.v4parts[1] + "." +
+      variables.v4parts[2] + "." + string(int(variables.v4parts[3]) + variables.pick)
+  # IPv6: prefix is the network address whose host bits are zero (e.g. "fe80::").
+  # We render by appending the offset as a hex hextet suffix. hexOffset[o] maps
+  # 0..63 -> "0".."3f". This is correct ONLY when the /122 network's trailing
+  # hextet is zero (prefix ends in "::"); arbitrary prefixes need hex arithmetic
+  # on the last hextet, which CEL can't do cheaply. See README "Limitations".
+  - name: hexOffset
+    expression: >-
+      ["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f",
+       "10","11","12","13","14","15","16","17","18","19","1a","1b","1c","1d","1e","1f",
+       "20","21","22","23","24","25","26","27","28","29","2a","2b","2c","2d","2e","2f",
+       "30","31","32","33","34","35","36","37","38","39","3a","3b","3c","3d","3e","3f"]
+  - name: v6addr
+    expression: "object.spec.sliceSubnet.prefix + variables.hexOffset[variables.pick]"
+  - name: addr
+    expression: "variables.family == 'IPv4' ? variables.v4addr : variables.v6addr"
+  mutations:
+  - patchType: JSONPatch
+    jsonPatch:
+      expression: >-
+        [
+          JSONPatch{
+            op: "add",
+            path: "/status",
+            value: Object.status{
+              allocation:
+                variables.kept.map(a, Object.status.allocation{
+                  requestName: a.requestName,
+                  offset: a.offset,
+                  address: a.address
+                })
+                +
+                ((variables.have && size(variables.freeList) > 0)
+                  ? [Object.status.allocation{
+                      requestName: variables.pending[0].name,
+                      offset: variables.pick,
+                      address: variables.addr
+                    }]
+                  : [])
+            }
+          }
+        ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: ipslice-allocator-binding
+spec:
+  policyName: ipslice-allocator

@@ -27,11 +27,14 @@ spec:
       name: Namespace
       priority: 1
       type: string
-    - jsonPath: .spec.sliceSubnet.networkAddress
-      name: NetworkAddress
-      type: integer
-    - jsonPath: .spec.sliceSubnet.prefixLength
+    - jsonPath: .spec.sliceSubnet.family
+      name: Family
+      type: string
+    - jsonPath: .spec.sliceSubnet.prefix
       name: Prefix
+      type: string
+    - jsonPath: .spec.sliceSubnet.prefixLength
+      name: PrefixLength
       priority: 1
       type: integer
     - jsonPath: .metadata.creationTimestamp
@@ -101,72 +104,59 @@ spec:
                   description: |-
                     Request asks the allocator for one IP address.
 
-                    By default the IP is taken from anywhere in the slice. A request MAY narrow
-                    where the IP comes from by naming a subnet (networkAddress + prefixLength): the
-                    allocator then picks a free IP from the intersection of that subnet and this
-                    slice. The two fields are set together or not at all, and the subnet must be
-                    aligned. The subnet only has to be COMPATIBLE with the slice — one must contain
-                    the other (a tighter subnet inside the slice, or a broader subnet that contains
-                    it); a disjoint subnet is rejected (see the root "request subnet" rule).
+                    By default the address is taken from anywhere in the slice. A request MAY narrow
+                    where it comes from with an OFFSET WINDOW: offset (the first host offset within
+                    the slice) plus length (the number of addresses). The allocator then picks the
+                    lowest free offset in [offset, offset+length-1]. The two fields are set together
+                    or not at all; the window must be aligned (offset % length == 0), a power of two
+                    in size, and fit inside the slice (checked by the root rules). Offsets are
+                    family-agnostic small integers, so this works identically for IPv4 and IPv6.
                   properties:
+                    length:
+                      description: |-
+                        Length is the size of the window to allocate from (a power of two).
+                        Optional: set together with offset. Immutable once set.
+                      format: int32
+                      maximum: 64
+                      minimum: 1
+                      type: integer
+                      x-kubernetes-validations:
+                      - message: a request's length is immutable; remove the request
+                          and add a new one to change its window
+                        rule: self == oldSelf
                     name:
                       description: Name identifies the request.
                       maxLength: 63
                       type: string
-                    networkAddress:
+                    offset:
                       description: |-
-                        NetworkAddress is the network address of the subnet to allocate from,
-                        as an integer (int(192.168.0.4) == 3232235524). Optional: set together
-                        with prefixLength to constrain the allocation to a subnet, or omit both
-                        to allocate from anywhere in the slice. Immutable once set.
-                      format: int64
-                      maximum: 4294967295
-                      minimum: 0
-                      type: integer
-                      x-kubernetes-validations:
-                      - message: a request's networkAddress is immutable; remove the
-                          request and add a new one to change its subnet
-                        rule: self == oldSelf
-                    prefixLength:
-                      description: |-
-                        PrefixLength is the prefix length of the subnet to allocate from.
-                        Optional: set together with networkAddress. Immutable once set.
+                        Offset is the first host offset (within the slice) of the window to allocate
+                        from, 0 .. 63. Optional: set together with length to constrain
+                        the allocation to a window, or omit both to allocate from anywhere in the
+                        slice. Immutable once set.
                       format: int32
-                      maximum: 32
+                      maximum: 63
                       minimum: 0
                       type: integer
                       x-kubernetes-validations:
-                      - message: a request's prefixLength is immutable; remove the
-                          request and add a new one to change its subnet
+                      - message: a request's offset is immutable; remove the request
+                          and add a new one to change its window
                         rule: self == oldSelf
                   required:
                   - name
                   type: object
                   x-kubernetes-validations:
-                  - message: networkAddress and prefixLength must be set together
-                      (a request's subnet), or both omitted (allocate from anywhere
-                      in the slice)
-                    rule: has(self.networkAddress) == has(self.prefixLength)
-                  - message: a request's networkAddress must be aligned to its prefixLength
-                      (a multiple of the subnet size)
-                    rule: '!has(self.networkAddress) || self.networkAddress % (self.prefixLength
-                      == 32 ? 1 : self.prefixLength == 31 ? 2 : self.prefixLength
-                      == 30 ? 4 : self.prefixLength == 29 ? 8 : self.prefixLength
-                      == 28 ? 16 : self.prefixLength == 27 ? 32 : self.prefixLength
-                      == 26 ? 64 : self.prefixLength == 25 ? 128 : self.prefixLength
-                      == 24 ? 256 : self.prefixLength == 23 ? 512 : self.prefixLength
-                      == 22 ? 1024 : self.prefixLength == 21 ? 2048 : self.prefixLength
-                      == 20 ? 4096 : self.prefixLength == 19 ? 8192 : self.prefixLength
-                      == 18 ? 16384 : self.prefixLength == 17 ? 32768 : self.prefixLength
-                      == 16 ? 65536 : self.prefixLength == 15 ? 131072 : self.prefixLength
-                      == 14 ? 262144 : self.prefixLength == 13 ? 524288 : self.prefixLength
-                      == 12 ? 1048576 : self.prefixLength == 11 ? 2097152 : self.prefixLength
-                      == 10 ? 4194304 : self.prefixLength == 9 ? 8388608 : self.prefixLength
-                      == 8 ? 16777216 : self.prefixLength == 7 ? 33554432 : self.prefixLength
-                      == 6 ? 67108864 : self.prefixLength == 5 ? 134217728 : self.prefixLength
-                      == 4 ? 268435456 : self.prefixLength == 3 ? 536870912 : self.prefixLength
-                      == 2 ? 1073741824 : self.prefixLength == 1 ? 2147483648 : 4294967296)
-                      == 0'
+                  - message: offset and length must be set together (a request's window),
+                      or both omitted (allocate from anywhere in the slice)
+                    rule: has(self.offset) == has(self.length)
+                  - message: a request's offset must be aligned to its length (a multiple
+                      of the window size)
+                    rule: '!has(self.offset) || self.offset % self.length == 0'
+                  - message: a request's length must be a power of two (1, 2, 4, 8,
+                      16, 32 or 64)
+                    rule: '!has(self.length) || (self.length == 1 || self.length ==
+                      2 || self.length == 4 || self.length == 8 || self.length ==
+                      16 || self.length == 32 || self.length == 64)'
                 maxItems: 64
                 type: array
                 x-kubernetes-list-map-keys:
@@ -176,57 +166,81 @@ spec:
                 description: |-
                   SliceSubnet is the subnet for this IP slice.
 
-                  The slice size is a fixed system-wide constant: every slice is a /26
-                  (prefixLength 26, addressSpace 64). This is what makes the blocks a true
-                  partition — with a fixed size and an aligned networkAddress, every IPv4
-                  address belongs to exactly one slice, so disjointness holds WITHOUT any
-                  cross-object check (rule 2). networkAddress alone (plus podNetworkRef) is
-                  therefore the block identity encoded in the name; it is immutable.
+                  The slice size is a fixed system-wide constant: every slice holds 64
+                  addresses -- a /26 for IPv4, a /122 for IPv6. The size is not a field: it is
+                  implied by the pinned prefixLength (below) and baked into the offset bounds
+                  (0..63) as literals. This is what makes the blocks a true partition: with a
+                  fixed size and a network-aligned prefix, every address belongs to exactly one
+                  slice, so disjointness holds WITHOUT any cross-object check (rule 2). The
+                  prefix (plus podNetworkRef) is the block identity encoded in the name; the
+                  whole subnet is immutable.
 
-                  If you ever change the slice size, change all four in lockstep: the two
-                  constants below, the alignment modulus, and the usable-range root rule.
+                  Uniqueness across families relies on the prefix being CANONICAL: unlike an
+                  integer, a text IP has many spellings for one network. ip.isCanonical()
+                  enforces the single canonical form in CEL, so a canonical prefix maps to
+                  exactly one name (see pkg/naming.Name and the VAP).
+
+                  If you ever change the slice size, change these in lockstep: the pinned
+                  prefixLengths, the offset bounds (0..63 on Request/Allocation and the "< 64"
+                  root rules), and MaxItems on the lists.
+                  The prefix length is a family-branched string LITERAL ('/26' or '/122'), not
+                  string(self.prefixLength): the CRD's static cost estimator sizes string(int)
+                  by the integer's max magnitude, which inflates the concatenated CIDR string
+                  and pushes this rule >100x over budget. prefixLength is already pinned per
+                  family (rule above), so the literal is exact and keeps the check in the CRD
+                  (where it always runs and can't be unbound) instead of a VAP.
                 properties:
-                  addressSpace:
+                  family:
+                    description: 'Family is the IP family of the slice: "IPv4" or
+                      "IPv6".'
+                    enum:
+                    - IPv4
+                    - IPv6
+                    type: string
+                  prefix:
                     description: |-
-                      AddressSpace is the address space of the subnet.
-                      For IPv4, the address space is 2^(32 - prefixLength).
-                      For IPv6, the address space is 2^(128 - prefixLength).
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  networkAddress:
-                    description: |-
-                      NetworkAddress is the network address of the subnet.
-                      Bounded to the IPv4 range; it is part of the block identity encoded in the
-                      object name, so it must stay a bounded, stringifiable integer.
-                    format: int64
-                    maximum: 4294967295
-                    minimum: 0
-                    type: integer
+                      Prefix is the network address of the subnet, as a canonical IP string
+                      (e.g. "192.168.0.0" or "fe80::"). It is part of the block identity encoded in
+                      the object name. CEL does no arithmetic on it; the IP/CIDR CEL libraries
+                      validate it. Must be canonical (ip.isCanonical) so the identity -> name
+                      mapping is unambiguous. Max IPv6 text length is 45 chars.
+                    maxLength: 45
+                    type: string
                   prefixLength:
-                    description: PrefixLength is the prefix length of the subnet.
+                    description: |-
+                      PrefixLength is the prefix length of the subnet: 26 for IPv4, 122 for IPv6
+                      (both cover 64 addresses). This is what fixes the slice size; there is no
+                      separate addressSpace field (the size is implied and baked into the offset
+                      bounds 0..63).
                     format: int32
-                    maximum: 32
+                    maximum: 128
                     minimum: 0
                     type: integer
                 required:
-                - addressSpace
-                - networkAddress
+                - family
+                - prefix
                 - prefixLength
                 type: object
                 x-kubernetes-validations:
                 - message: sliceSubnet is immutable; create a new IPSlice for a different
                     block
                   rule: self == oldSelf
-                - message: 'slice size is fixed: sliceSubnet.prefixLength must be
-                    26 (a /26)'
-                  rule: self.prefixLength == 26
-                - message: 'slice size is fixed: sliceSubnet.addressSpace must be
-                    64 (a /26)'
-                  rule: self.addressSpace == 64
-                - message: sliceSubnet.networkAddress must be aligned to the /26 grid
-                    (a multiple of 64)
-                  rule: self.networkAddress % 64 == 0
+                - message: sliceSubnet.prefix must be a valid IP address
+                  rule: isIP(self.prefix)
+                - message: sliceSubnet.prefix must be in canonical form (e.g. lowercase,
+                    compressed IPv6)
+                  rule: '!isIP(self.prefix) || ip.isCanonical(self.prefix)'
+                - message: sliceSubnet.prefix family must match sliceSubnet.family
+                  rule: '!isIP(self.prefix) || ip(self.prefix).family() == (self.family
+                    == ''IPv4'' ? 4 : 6)'
+                - message: 'slice size is fixed: prefixLength must be 26 for IPv4
+                    or 122 for IPv6 (both are 64 addresses)'
+                  rule: 'self.family == ''IPv4'' ? self.prefixLength == 26 : self.prefixLength
+                    == 122'
+                - message: sliceSubnet.prefix must be the network address (host bits
+                    zero) aligned to prefixLength
+                  rule: '!isIP(self.prefix) || string(cidr(self.prefix + (self.family
+                    == ''IPv4'' ? ''/26'' : ''/122'')).masked().ip()) == self.prefix'
             required:
             - podNetworkRef
             - sliceSubnet
@@ -243,16 +257,19 @@ spec:
                   properties:
                     address:
                       description: |-
-                        Address is the allocated IP address in string format.
-                        Max "255.255.255.255" == 15 chars.
-                      maxLength: 15
+                        Address is the allocated IP address in string format, rendered by the
+                        allocator. It is set for IPv4 (which CEL can render from prefix + offset with
+                        exact integer arithmetic) and omitted for IPv6 (which CEL cannot render:
+                        there is no 128-bit arithmetic). For IPv6, consumers derive the address from
+                        the slice prefix and this offset. Max IPv6 text length is 45 chars.
+                      maxLength: 45
                       type: string
-                    ip:
+                    offset:
                       description: |-
-                        IP is the allocated IP address.
-                        Bounded to the IPv4 range so CEL cost estimation of string(ip) stays cheap.
-                      format: int64
-                      maximum: 4294967295
+                        Offset is the allocated host offset within the slice, 0 .. 63.
+                        This is the load-bearing value: the concrete address is (prefix + offset).
+                      format: int32
+                      maximum: 63
                       minimum: 0
                       type: integer
                     requestName:
@@ -261,8 +278,7 @@ spec:
                       maxLength: 63
                       type: string
                   required:
-                  - address
-                  - ip
+                  - offset
                   - requestName
                   type: object
                 maxItems: 64
@@ -281,56 +297,26 @@ spec:
         - message: status.allocation has an entry with no matching spec.request
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
             has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))'
-        - message: an allocated IP is outside the slice range
+        - message: an allocated offset is outside the slice range
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            a.ip >= self.spec.sliceSubnet.networkAddress && a.ip <= self.spec.sliceSubnet.networkAddress
-            + self.spec.sliceSubnet.addressSpace - 1)'
-        - message: duplicate IP in status.allocation
+            a.offset >= 0 && a.offset < 64)'
+        - message: duplicate offset in status.allocation
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            size(self.status.allocation.filter(x, x.ip == a.ip)) == 1)'
-        - message: an existing allocation IP cannot change (only released by removing
+            size(self.status.allocation.filter(x, x.offset == a.offset)) == 1)'
+        - message: an existing allocation offset cannot change (only released by removing
             its request)
           rule: '!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o,
             !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName))
             || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a,
-            a.requestName == o.requestName && a.ip == o.ip)))'
-        - message: a request subnet is disjoint from this slice; the slice and the
-            request subnet must contain one another
-          rule: '!has(self.spec.request) || self.spec.request.all(r, !has(r.networkAddress)
-            || (r.networkAddress < self.spec.sliceSubnet.networkAddress + self.spec.sliceSubnet.addressSpace
-            && self.spec.sliceSubnet.networkAddress < r.networkAddress + (r.prefixLength
-            == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength
-            == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength
-            == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 :
-            r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength
-            == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192
-            : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength
-            == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ?
-            262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576
-            : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength
-            == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7
-            ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728
-            : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 :
-            r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 :
-            4294967296)))'
-        - message: an allocated IP is outside its request's subnet
+            a.requestName == o.requestName && a.offset == o.offset)))'
+        - message: a request's offset window must fit inside the slice (offset + length
+            <= 64)
+          rule: '!has(self.spec.request) || self.spec.request.all(r, !has(r.offset)
+            || r.offset + r.length <= 64)'
+        - message: an allocated offset is outside its request's window
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            self.spec.request.exists(r, r.name == a.requestName && (!has(r.networkAddress)
-            || (a.ip >= r.networkAddress && a.ip < r.networkAddress + (r.prefixLength
-            == 32 ? 1 : r.prefixLength == 31 ? 2 : r.prefixLength == 30 ? 4 : r.prefixLength
-            == 29 ? 8 : r.prefixLength == 28 ? 16 : r.prefixLength == 27 ? 32 : r.prefixLength
-            == 26 ? 64 : r.prefixLength == 25 ? 128 : r.prefixLength == 24 ? 256 :
-            r.prefixLength == 23 ? 512 : r.prefixLength == 22 ? 1024 : r.prefixLength
-            == 21 ? 2048 : r.prefixLength == 20 ? 4096 : r.prefixLength == 19 ? 8192
-            : r.prefixLength == 18 ? 16384 : r.prefixLength == 17 ? 32768 : r.prefixLength
-            == 16 ? 65536 : r.prefixLength == 15 ? 131072 : r.prefixLength == 14 ?
-            262144 : r.prefixLength == 13 ? 524288 : r.prefixLength == 12 ? 1048576
-            : r.prefixLength == 11 ? 2097152 : r.prefixLength == 10 ? 4194304 : r.prefixLength
-            == 9 ? 8388608 : r.prefixLength == 8 ? 16777216 : r.prefixLength == 7
-            ? 33554432 : r.prefixLength == 6 ? 67108864 : r.prefixLength == 5 ? 134217728
-            : r.prefixLength == 4 ? 268435456 : r.prefixLength == 3 ? 536870912 :
-            r.prefixLength == 2 ? 1073741824 : r.prefixLength == 1 ? 2147483648 :
-            4294967296)))))'
+            self.spec.request.exists(r, r.name == a.requestName && (!has(r.offset)
+            || (a.offset >= r.offset && a.offset < r.offset + r.length))))'
     served: true
     storage: true
     subresources: {}

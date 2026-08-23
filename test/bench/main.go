@@ -338,16 +338,26 @@ func printMetricDiff(before, after map[string]float64, fill int) {
 	fmt.Println("        apiserver_request(ipslices) minus admission_step ~= CRD x-kubernetes-validations + etcd.")
 }
 
-// newSlice builds a valid, server-named /26 IPSlice at the given network address.
+// newSlice builds a valid, server-named /26 IPv4 IPSlice at the given network
+// address (as an integer, rendered to the dotted prefix string the API expects).
 func newSlice(networkAddress int64) *v1alpha1.IPSlice {
 	spec := v1alpha1.IPSliceSpec{
 		PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
-		SliceSubnet:   v1alpha1.Subnet{NetworkAddress: networkAddress, PrefixLength: 26, AddressSpace: 64},
+		SliceSubnet: v1alpha1.Subnet{
+			Family:       "IPv4",
+			Prefix:       dottedIPv4(networkAddress),
+			PrefixLength: 26,
+		},
 	}
 	return &v1alpha1.IPSlice{
 		ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)},
 		Spec:       spec,
 	}
+}
+
+// dottedIPv4 renders an IPv4 address held as an integer to its dotted-quad string.
+func dottedIPv4(ip int64) string {
+	return fmt.Sprintf("%d.%d.%d.%d", ip>>24&0xff, ip>>16&0xff, ip>>8&0xff, ip&0xff)
 }
 
 func printStats(label string, ds []time.Duration) {

@@ -1,16 +1,15 @@
-# Backstop for the invariants the CRD schema cannot express.
+# Backstop for the invariants the CRD schema cannot express, and the name
+# enforcement that makes naming server-owned.
 #
 # Everything that fits the CRD's static cost budget lives in the CRD schema
-# (apis/v1alpha1/types.go markers). The two checks below cannot: both build a
-# string with string(int), which the CRD's STATIC cost estimator sizes by the
-# integer's max VALUE (~4.29e9) rather than its digit count, blowing the per-rule
-# budget by >100x. A ValidatingAdmissionPolicy enforces cost at RUNTIME instead,
-# on the real values (octets 0-255, small network addresses), where it is trivial.
-#
-# NOTE: this policy replaces the earlier "ipslice-address-consistency" policy. If
-# that one was applied to your cluster, delete it:
-#   kubectl delete validatingadmissionpolicy ipslice-address-consistency
-#   kubectl delete validatingadmissionpolicybinding ipslice-address-consistency-binding
+# (apis/v1alpha1/types.go markers): field ranges, list caps, immutability, the
+# offset/window rules, and the prefix validity/canonicality/alignment checks (via
+# the IP/CIDR CEL libraries). The two checks below live here:
+#   1. metadata.name == canonical name. This is the naming contract, enforced.
+#   2. IPv4 allocation.address == render(prefix, offset). Its natural form builds a
+#      string with string(int); the CRD's STATIC cost estimator sizes string(int)
+#      by the value's magnitude and over-budgets it, so it runs here at RUNTIME on
+#      small octet values instead. IPv6 stores no address, so this only checks v4.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -23,33 +22,43 @@ spec:
       apiVersions: ["v1alpha1"]
       operations:  ["CREATE", "UPDATE"]
       resources:   ["ipslices"]
+  variables:
+  # sliceId is the family-agnostic block identity encoded in the name:
+  # "<family-lower>-<sanitized-canonical-prefix>-<prefixLength>". The prefix is
+  # canonical (the CRD enforces ip.isCanonical), so replacing "." and ":" with "-"
+  # yields one token per network. MUST match pkg/naming.Name() byte-for-byte.
+  - name: sliceId
+    expression: >-
+      object.spec.sliceSubnet.family.lowerAscii() + "-" +
+      object.spec.sliceSubnet.prefix.replace(".", "-").replace(":", "-") + "-" +
+      string(object.spec.sliceSubnet.prefixLength)
   validations:
-  # 1. metadata.name MUST be the canonical name for the block identity. This is
-  #    what makes naming server-owned instead of a client contract: each identity
-  #    has exactly one legal name, so a wrong name is denied and a second object
-  #    for the same block collides on create -> never two objects for one block,
-  #    and clients cannot invent names. This CEL MUST match pkg/naming.Name()
-  #    byte-for-byte; change them together.
+  # 1. metadata.name MUST be the canonical name for the block identity. Each
+  #    identity has exactly one legal name, so a wrong name is denied and a second
+  #    object for the same block collides on create -> never two objects for one
+  #    block, and clients cannot invent names.
   - expression: >-
       object.metadata.name ==
         object.spec.podNetworkRef.name + "." +
         object.spec.podNetworkRef.kind +
         ((has(object.spec.podNetworkRef.namespace) && object.spec.podNetworkRef.namespace != "")
           ? "." + object.spec.podNetworkRef.namespace : "") + "." +
-        string(object.spec.sliceSubnet.networkAddress)
+        variables.sliceId
     message: "metadata.name must be the canonical name for this block's identity (see pkg/naming.Name); it is derived, not chosen"
     reason: Invalid
-  # 2. status.address must be the dotted-decimal form of status.ip. Defense in
-  #    depth: the allocator writes both, so this catches any bypass of the MAP.
+  # 2. For IPv4, status.allocation[].address must be the dotted render of
+  #    (prefix, offset). Defense in depth against a bypass of the allocator. IPv6
+  #    stores no address (has(a.address) is false), so it is skipped there.
   - expression: >-
       !has(object.status) || !has(object.status.allocation) ||
       object.status.allocation.all(a,
-        a.address ==
-          string(a.ip / 16777216 % 256) + "." +
-          string(a.ip / 65536 % 256) + "." +
-          string(a.ip / 256 % 256) + "." +
-          string(a.ip % 256))
-    message: "allocation.address does not match allocation.ip"
+        !has(a.address) ||
+        a.address == (
+          object.spec.sliceSubnet.prefix.split(".")[0] + "." +
+          object.spec.sliceSubnet.prefix.split(".")[1] + "." +
+          object.spec.sliceSubnet.prefix.split(".")[2] + "." +
+          string(int(object.spec.sliceSubnet.prefix.split(".")[3]) + a.offset)))
+    message: "allocation.address does not match the render of (prefix, offset)"
     reason: Invalid
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -1,10 +1,18 @@
 # The allocator. No controller: the API server runs this CEL at admission time
 # and fills status.allocation with a free address from this slice's block.
 #
+# FAMILY-AGNOSTIC OFFSET MODEL. The allocator reasons only about host OFFSETS
+# (0 .. 63), which are small integers that fit CEL's int64 for EVERY
+# address family. It never holds a 128-bit IPv6 address. The network is an opaque
+# canonical `prefix` STRING it does no math on. The only family-specific step is
+# rendering the display `address`, and CEL can only do that for IPv4 (exact
+# integer arithmetic on octets); for IPv6 the allocator stores the offset only and
+# consumers derive the address from (prefix, offset).
+#
 # Correctness rests on:
 #   1. All allocations for a slice live in ONE object -> etcd resourceVersion CAS
 #      serializes concurrent writers (loser gets 409 and retries).
-#   2. IPs are stored as integers, so the arithmetic is trivial.
+#   2. Offsets are integers, so the arithmetic is trivial and family-independent.
 #   3. Release: the mutation REBUILDS status from spec each time (JSONPatch), so a
 #      request removed from spec.request drops out of status.allocation. This is
 #      why it uses JSONPatch (rebuild) rather than ApplyConfiguration (additive).
@@ -15,16 +23,13 @@
 #      (The status subresource is off, so RBAC cannot gate status writes; this is
 #      how we make status effectively allocator-owned instead.)
 #
-# ONE new IP per write. CEL has no fold/reduce, so it cannot hand distinct
-# addresses to several NEW requests in a single pass when their subnets overlap
-# (e.g. two requests both asking for an IP in 192.168.0.4/30 need .4 and .5, and
-# CEL cannot "remember .4 was just taken"). So the allocator only ever assigns the
-# FIRST still-unallocated request, taking the lowest free address inside that
-# request's subnet. If a write adds more than one new request, the extras stay
-# unallocated and the CRD's "every request allocated" rule rejects the whole
-# write -- so clients add requests one at a time (which is the natural
-# one-entry-per-client server-side-apply flow anyway). Allocating one at a time is
-# always correct because every prior IP is already committed in oldObject.
+# ONE new address per write. CEL has no fold/reduce, so it cannot hand distinct
+# offsets to several NEW requests in a single pass when their windows overlap. So
+# the allocator only ever assigns the FIRST still-unallocated request, taking the
+# lowest free offset inside that request's window. If a write adds more than one
+# new request, the extras stay unallocated and the CRD's "every request allocated"
+# rule rejects the whole write -- so clients add requests one at a time (the
+# natural one-entry-per-client server-side-apply flow anyway).
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -40,24 +45,19 @@ spec:
       resources:   ["ipslices"]
   # No matchConditions: the allocator runs on EVERY write and fully rebuilds
   # /status. The rebuild is idempotent, so running unconditionally is safe, and it
-  # guarantees any status a client tries to submit is unconditionally overwritten
-  # by the allocator's result -> a client cannot forge status.
+  # guarantees any status a client tries to submit is unconditionally overwritten.
   variables:
-  - name: lo          # first allocatable address (the block's network address is allocatable)
-    expression: "object.spec.sliceSubnet.networkAddress"
-  - name: hi          # last allocatable address (the block's broadcast address is allocatable)
-    expression: "object.spec.sliceSubnet.networkAddress + object.spec.sliceSubnet.addressSpace - 1"
+  - name: space       # number of host offsets in the slice: a fixed constant (a
+                      # /26 and a /122 both hold 64), not a spec field
+    expression: "64"
   # Prior allocations come from oldObject (the value already stored by the API
-  # server, itself produced by this allocator), NOT from the incoming object. This
-  # is the anti-tamper guarantee: a client's status.allocation is never read, so it
-  # cannot influence the result. oldObject is null on CREATE.
+  # server), NOT from the incoming object -- the anti-tamper guarantee. oldObject
+  # is null on CREATE.
   - name: existing
     expression: >-
       oldObject == null ? [] :
         ((has(oldObject.status) && has(oldObject.status.allocation))
           ? oldObject.status.allocation : [])
-  # spec.request is optional; accessing it directly throws "no such key" when it is
-  # absent, so normalize it to a list once here and use variables.requests below.
   - name: requests
     expression: "has(object.spec.request) ? object.spec.request : []"
   # Keep only allocations whose request is still present -> removals are released.
@@ -65,38 +65,31 @@ spec:
     expression: >-
       variables.existing.filter(a,
         variables.requests.exists(r, r.name == a.requestName))
-  - name: usedIps
-    expression: "variables.kept.map(a, a.ip)"
+  # The load-bearing set is OFFSETS, not absolute addresses.
+  - name: usedOffsets
+    expression: "variables.kept.map(a, a.offset)"
   # Requests still needing an address, in declared order. Only the first is served
-  # per write (see the header comment); any others are left for a later write.
+  # per write (see the header comment).
   - name: pending
     expression: >-
       variables.requests.filter(r, !variables.kept.exists(a, a.requestName == r.name))
   - name: have
     expression: "size(variables.pending) > 0"
-  # Whether the first pending request narrowed its allocation to a subnet.
+  # Whether the first pending request narrowed to an offset window.
   - name: constrained
-    expression: "variables.have && has(variables.pending[0].networkAddress)"
-  # The subnet the first pending request draws from: its own subnet if it set one,
-  # otherwise the whole slice.
-  - name: reqNet
+    expression: "variables.have && has(variables.pending[0].offset)"
+  # Allocation window as an OFFSET range [wlo, whi] within the slice. No subnet
+  # size table: the client passes `length` directly (the CRD checks it is a power
+  # of two, aligned, and fits) -- the 33-branch 2^(32-prefix) ternary is gone.
+  - name: wlo
+    expression: "variables.constrained ? variables.pending[0].offset : 0"
+  - name: whi
     expression: >-
-      variables.constrained ? variables.pending[0].networkAddress
-                            : object.spec.sliceSubnet.networkAddress
-  # Subnet size = 2^(32-prefixLength), enumerated because CEL has no shift/pow.
-  - name: reqSize
-    expression: >-
-      variables.constrained ?
-        (variables.pending[0].prefixLength == 32 ? 1 : variables.pending[0].prefixLength == 31 ? 2 : variables.pending[0].prefixLength == 30 ? 4 : variables.pending[0].prefixLength == 29 ? 8 : variables.pending[0].prefixLength == 28 ? 16 : variables.pending[0].prefixLength == 27 ? 32 : variables.pending[0].prefixLength == 26 ? 64 : variables.pending[0].prefixLength == 25 ? 128 : variables.pending[0].prefixLength == 24 ? 256 : variables.pending[0].prefixLength == 23 ? 512 : variables.pending[0].prefixLength == 22 ? 1024 : variables.pending[0].prefixLength == 21 ? 2048 : variables.pending[0].prefixLength == 20 ? 4096 : variables.pending[0].prefixLength == 19 ? 8192 : variables.pending[0].prefixLength == 18 ? 16384 : variables.pending[0].prefixLength == 17 ? 32768 : variables.pending[0].prefixLength == 16 ? 65536 : variables.pending[0].prefixLength == 15 ? 131072 : variables.pending[0].prefixLength == 14 ? 262144 : variables.pending[0].prefixLength == 13 ? 524288 : variables.pending[0].prefixLength == 12 ? 1048576 : variables.pending[0].prefixLength == 11 ? 2097152 : variables.pending[0].prefixLength == 10 ? 4194304 : variables.pending[0].prefixLength == 9 ? 8388608 : variables.pending[0].prefixLength == 8 ? 16777216 : variables.pending[0].prefixLength == 7 ? 33554432 : variables.pending[0].prefixLength == 6 ? 67108864 : variables.pending[0].prefixLength == 5 ? 134217728 : variables.pending[0].prefixLength == 4 ? 268435456 : variables.pending[0].prefixLength == 3 ? 536870912 : variables.pending[0].prefixLength == 2 ? 1073741824 : variables.pending[0].prefixLength == 1 ? 2147483648 : 4294967296)
-        : object.spec.sliceSubnet.addressSpace
-  # Allocation window = (slice usable range) intersect (request subnet).
-  - name: clo
-    expression: "variables.lo > variables.reqNet ? variables.lo : variables.reqNet"
-  - name: chi
-    expression: >-
-      variables.hi < variables.reqNet + variables.reqSize - 1
-        ? variables.hi : variables.reqNet + variables.reqSize - 1
-  # Bounded offset list to enumerate the slice's addresses (supports up to /24).
+      variables.constrained
+        ? variables.pending[0].offset + variables.pending[0].length - 1
+        : variables.space - 1
+  # Bounded offset list to enumerate the slice's addresses (goes to 255 to leave
+  # headroom for a larger fixed size, as before).
   - name: offsets
     expression: >-
       [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
@@ -115,19 +108,34 @@ spec:
        208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
        224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
        240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255]
-  # Free addresses inside the allocation window, ascending. The first pending
-  # request takes the lowest one.
+  # Free offsets inside the window, ascending. The first pending request takes the
+  # lowest one.
   - name: freeList
     expression: >-
-      variables.offsets.map(o, object.spec.sliceSubnet.networkAddress + o)
-        .filter(ip, ip >= variables.clo && ip <= variables.chi && !(ip in variables.usedIps))
+      variables.offsets.filter(o,
+        o >= variables.wlo && o <= variables.whi && o < variables.space
+        && !(o in variables.usedOffsets))
+  - name: pick       # the offset to assign (guarded by size(freeList) > 0 below)
+    expression: "size(variables.freeList) > 0 ? variables.freeList[0] : 0"
+  - name: room       # is there a free offset for the first pending request?
+    expression: "variables.have && size(variables.freeList) > 0"
+  # IPv4 display address: prefix is dotted, the slice is aligned so the last octet
+  # is a multiple of 64 and (lastOctet + offset) never carries past 255. Exact
+  # integer arithmetic on 0..255, cheap at runtime.
+  - name: v4parts
+    expression: "object.spec.sliceSubnet.prefix.split('.')"
+  - name: v4addr
+    expression: >-
+      variables.v4parts[0] + "." + variables.v4parts[1] + "." +
+      variables.v4parts[2] + "." + string(int(variables.v4parts[3]) + variables.pick)
   mutations:
   - patchType: JSONPatch
     jsonPatch:
-      # Rebuild the whole status: kept allocations, plus (at most) one entry for
-      # the first pending request, given the lowest free address in its window.
-      # If there is no room (window full or subnet disjoint) the request stays
-      # unallocated and the CRD rejects the write.
+      # Rebuild the whole status. Branch on family: IPv4 entries carry a rendered
+      # `address`; IPv6 entries carry only the `offset` (CEL cannot render a
+      # 128-bit address). Each branch keeps the surviving allocations plus (at
+      # most) one entry for the first pending request at the lowest free offset.
+      # If there is no room the request stays unallocated and the CRD rejects.
       expression: >-
         [
           JSONPatch{
@@ -135,23 +143,26 @@ spec:
             path: "/status",
             value: Object.status{
               allocation:
-                variables.kept.map(a, Object.status.allocation{
-                  requestName: a.requestName,
-                  ip: a.ip,
-                  address: a.address
-                })
-                +
-                ((variables.have && size(variables.freeList) > 0)
-                  ? [Object.status.allocation{
-                      requestName: variables.pending[0].name,
-                      ip: variables.freeList[0],
-                      address:
-                        string(variables.freeList[0] / 16777216 % 256) + "." +
-                        string(variables.freeList[0] / 65536 % 256) + "." +
-                        string(variables.freeList[0] / 256 % 256) + "." +
-                        string(variables.freeList[0] % 256)
-                    }]
-                  : [])
+                object.spec.sliceSubnet.family == "IPv4"
+                ? (variables.kept.map(a, Object.status.allocation{
+                     requestName: a.requestName, offset: a.offset, address: a.address
+                   })
+                   + (variables.room
+                     ? [Object.status.allocation{
+                         requestName: variables.pending[0].name,
+                         offset: variables.pick,
+                         address: variables.v4addr
+                       }]
+                     : []))
+                : (variables.kept.map(a, Object.status.allocation{
+                     requestName: a.requestName, offset: a.offset
+                   })
+                   + (variables.room
+                     ? [Object.status.allocation{
+                         requestName: variables.pending[0].name,
+                         offset: variables.pick
+                       }]
+                     : []))
             }
           }
         ]

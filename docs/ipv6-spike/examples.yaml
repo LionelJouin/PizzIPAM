@@ -1,0 +1,64 @@
+# SPIKE examples for the offset-based unified model (see README.md).
+# These will NOT validate against the live CRD in deployment/ — they target the
+# proposed schema in README.md ("Proposed schema"). They are here to show the
+# shape of an IPv4 and an IPv6 slice side by side.
+---
+# IPv4 slice: 192.168.0.0/26. All 64 offsets (0..63) allocatable.
+# name = <name>.<kind>.<sliceId>  where sliceId = ipv4-192-168-0-0-26
+apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
+kind: IPSlice
+metadata:
+  name: abc.blue-network.ipv4-192-168-0-0-26
+spec:
+  podNetworkRef:
+    name: abc
+    kind: blue-network
+  sliceSubnet:
+    family: IPv4
+    prefix: "192.168.0.0"    # opaque network string; the allocator does no math on it
+    prefixLength: 26
+    addressSpace: 64
+  request:
+  - name: alpha              # unconstrained: lowest free offset -> 192.168.0.0
+  - name: beta               # narrowed to offsets [32,35] (a 4-address window)
+    offset: 32
+    length: 4
+# status (written by the allocator) would look like:
+# status:
+#   allocation:
+#   - requestName: alpha
+#     offset: 0
+#     address: "192.168.0.0"
+#   - requestName: beta
+#     offset: 32
+#     address: "192.168.0.32"
+---
+# IPv6 slice: fe80::/122. Same 64 offsets (0..63), rendered as fe80::0 .. fe80::3f.
+# name = <name>.<kind>.<sliceId>  where sliceId = ipv6-fe80---122
+apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
+kind: IPSlice
+metadata:
+  name: abc.blue-network.ipv6-fe80---122
+spec:
+  podNetworkRef:
+    name: abc
+    kind: blue-network
+  sliceSubnet:
+    family: IPv6
+    prefix: "fe80::"         # trailing hextet is zero -> renderable in CEL (see Limitations)
+    prefixLength: 122
+    addressSpace: 64
+  request:
+  - name: alpha              # unconstrained -> fe80::0
+  - name: gamma              # narrowed to offsets [16,31] -> first free is fe80::10
+    offset: 16
+    length: 16
+# status (written by the allocator) would look like:
+# status:
+#   allocation:
+#   - requestName: alpha
+#     offset: 0
+#     address: "fe80::0"
+#   - requestName: gamma
+#     offset: 16
+#     address: "fe80::10"

@@ -32,28 +32,44 @@ func TestName(t *testing.T) {
 		want string
 	}{
 		{
-			name: "no namespace",
+			name: "IPv4, no namespace",
 			spec: v1alpha1.IPSliceSpec{
 				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network"},
-				SliceSubnet:   v1alpha1.Subnet{NetworkAddress: 3232235520, PrefixLength: 26, AddressSpace: 64},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.0.0", PrefixLength: 26},
 			},
-			want: "abc.blue-network.3232235520",
+			want: "abc.blue-network.ipv4-192-168-0-0-26",
 		},
 		{
-			name: "with namespace",
+			name: "IPv4, with namespace",
 			spec: v1alpha1.IPSliceSpec{
 				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network", Namespace: ptr("team-a")},
-				SliceSubnet:   v1alpha1.Subnet{NetworkAddress: 3232235584, PrefixLength: 26, AddressSpace: 64},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.0.64", PrefixLength: 26},
 			},
-			want: "abc.blue-network.team-a.3232235584",
+			want: "abc.blue-network.team-a.ipv4-192-168-0-64-26",
 		},
 		{
-			name: "empty namespace pointer behaves like no namespace",
+			name: "IPv4, empty namespace pointer behaves like no namespace",
 			spec: v1alpha1.IPSliceSpec{
 				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network", Namespace: ptr("")},
-				SliceSubnet:   v1alpha1.Subnet{NetworkAddress: 3232235520, PrefixLength: 26, AddressSpace: 64},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.0.0", PrefixLength: 26},
 			},
-			want: "abc.blue-network.3232235520",
+			want: "abc.blue-network.ipv4-192-168-0-0-26",
+		},
+		{
+			name: "IPv6",
+			spec: v1alpha1.IPSliceSpec{
+				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network"},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: "fe80::", PrefixLength: 122},
+			},
+			want: "abc.blue-network.ipv6-fe80---122",
+		},
+		{
+			name: "IPv6, non-canonical prefix is canonicalized",
+			spec: v1alpha1.IPSliceSpec{
+				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network"},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: "FE80:0:0:0:0:0:0:0", PrefixLength: 122},
+			},
+			want: "abc.blue-network.ipv6-fe80---122",
 		},
 	}
 
@@ -71,7 +87,7 @@ func TestName(t *testing.T) {
 func TestNameIsDeterministic(t *testing.T) {
 	spec := v1alpha1.IPSliceSpec{
 		PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network"},
-		SliceSubnet:   v1alpha1.Subnet{NetworkAddress: 3232235520, PrefixLength: 26, AddressSpace: 64},
+		SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.0.0", PrefixLength: 26},
 	}
 	if naming.Name(spec) != naming.Name(spec) {
 		t.Fatal("Name() is not deterministic for identical input")
