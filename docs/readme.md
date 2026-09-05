@@ -226,3 +226,44 @@ value: "object": every spec.request must be allocated in status (the slice may b
 Recompute the name for the next `/26` (`192.168.0.64/26` → name
 `abc.blue-network.ipv4-192-168-0-64-26`) and apply again — repeat until one
 accepts.
+
+## Performance characteristics (and one adversarial workload)
+
+This design is optimized for **spread allocation**: many independent callers each
+land in a *different* slice object. There every write is a lone writer on its own
+object, admission runs once, and there is no contention — so throughput is high
+and flat. In benchmarking against a real cluster this is roughly **~100× a
+locking, single-pool-object allocator (whereabouts)**: e.g. ~1600 alloc/s
+concurrent into a large fixed pool, versus ~10 alloc/s.
+
+There is one workload where it does the opposite — **concurrently filling a pool
+sized to just a few slices**:
+
+- All allocations for a slice live in **one object** (this is what makes the
+  no-controller, no-GET/LIST design work). Concurrent writers to that object
+  serialize on the apiserver's optimistic-concurrency loop: the loser re-reads
+  the fresh object and **re-runs the whole CEL admission**, then retries, until
+  its write lands.
+- So filling one slice of size `S` with `S` concurrent writers costs on the order
+  of `S²` admission runs. Filling `M` addresses spread over `M/S` slices costs
+  **≈ M·S** admission runs in total — linear in the *slice size*. With the fixed
+  `S = 64` (a `/26`), a concurrent burst into a nearly-full small pool drives the
+  apiserver CPU up and, once it saturates, individual applies exceed the client's
+  request deadline and fail.
+
+This is a deliberate trade, not a bug: the single-object-per-slice model is
+exactly what buys the spread-case speed and the single-round-trip protocol. The
+knob that trades between the two is the **slice size** (`S`): smaller slices mean
+less concurrent-fill contention (and would allow pools smaller than a `/26`), but
+more objects — which erodes the spread-case advantage. The size is fixed at `/26`
+(IPv4) / `/122` (IPv6) here; see `apis/v1alpha1/types.go`.
+
+Practical guidance:
+
+- **Prefer a pool much larger than the number of IPs you allocate at once.** With
+  ample free slices, callers spread naturally and never contend. This is the
+  design's sweet spot.
+- **Avoid a thundering-herd fill of a pool sized to a handful of slices.** If you
+  must, stagger the burst (or accept that it degrades to roughly a serial fill).
+- Pools **smaller than one slice** (e.g. a `/28`) are not supported: a slice is a
+  fixed `/26`.

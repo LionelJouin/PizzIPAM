@@ -17,7 +17,11 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -25,6 +29,9 @@ import (
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
 	"github.com/lioneljouin/pizzipam/pkg/naming"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -73,6 +80,50 @@ func newSliceV6(requests ...v1alpha1.Request) *v1alpha1.IPSlice {
 		ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)},
 		Spec:       spec,
 	}
+}
+
+// applyRequest performs the recommended single-round-trip allocation from
+// docs/demo.md: a server-side apply that carries ONLY this caller's own request
+// entry, under its own field manager. Because spec.request is a map-list keyed by
+// name, each field manager owns just its own entry and never clobbers another's,
+// so independent clients can allocate on the same slice with no prior GET.
+//
+// It retries on an optimistic-concurrency Conflict. Every allocation for a block
+// lives in one object (readme rule 3), so concurrent writers contend on that
+// object's resourceVersion and etcd's compare-and-swap serializes them: a loser
+// gets a 409 and retries -- it never corrupts state or double-allocates. Invalid
+// errors (e.g. a full slice) are terminal and are NOT retried.
+func applyRequest(ctx context.Context, name, requestName string) error {
+	spec := v1alpha1.IPSliceSpec{
+		PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
+		SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: v4Prefix, PrefixLength: 26},
+		Request:       []v1alpha1.Request{{Name: requestName}},
+	}
+	// TypeMeta is mandatory in an apply body (the server matches on apiVersion+kind);
+	// the typed Create/Update path would otherwise fill it in for us.
+	obj := &v1alpha1.IPSlice{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "multinetwork.networking.x-k8s.io/v1alpha1", Kind: "IPSlice"},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       spec,
+	}
+	data, err := json.Marshal(obj) // JSON is valid YAML, so it is a valid apply body
+	if err != nil {
+		return err
+	}
+
+	force := true
+	// A roomier backoff than retry.DefaultBackoff (5 steps): under a full 64-way
+	// fill a loser may need several rounds before it wins its compare-and-swap.
+	backoff := wait.Backoff{Steps: 20, Duration: 10 * time.Millisecond, Factor: 1.5, Jitter: 0.1, Cap: 2 * time.Second}
+	return retry.RetryOnConflict(backoff, func() error {
+		// concurrentClient: this helper is only ever called from the fan-out
+		// concurrency spec, which needs the raised rate limiter (see e2e_suite_test.go).
+		_, err := concurrentClient.MultinetworkV1alpha1().IPSlices().Patch(
+			ctx, name, types.ApplyPatchType, data,
+			metav1.PatchOptions{FieldManager: requestName, Force: &force},
+		)
+		return err
+	})
 }
 
 var _ = Describe("IPSlice allocation", func() {
@@ -298,6 +349,58 @@ var _ = Describe("IPSlice allocation", func() {
 			}
 		}
 		Expect(reuseOffset).To(Equal(freedOffset), "the freed offset should be handed to the next request (lowest free)")
+	})
+
+	It("fills the whole slice under concurrent applies and hands out every offset exactly once", func(ctx SpecContext) {
+		// The concurrent analog of the sequential fill above. N clients each ask for
+		// one IP on the SAME subnet at the same time. They all target the single
+		// block object (readme rule 3), so etcd's compare-and-swap serializes the
+		// writes: losers retry (inside applyRequest) rather than fail or
+		// double-allocate. The invariant under test: all 64 usable offsets are handed
+		// out exactly once, one per request, with no lost or duplicated allocation --
+		// proving correctness under real contention, not just when the client
+		// serializes the writes itself.
+		usable := int(offsetHi - offsetLo + 1) // 64
+		name := naming.Name(newSlice().Spec)
+		// No single call owns the object here, so point `created` at it by name so
+		// AfterEach still cleans it up.
+		created = &v1alpha1.IPSlice{ObjectMeta: metav1.ObjectMeta{Name: name}}
+
+		By(fmt.Sprintf("applying %d requests concurrently, one field manager per request", usable))
+		var wg sync.WaitGroup
+		errs := make([]error, usable)
+		for i := 0; i < usable; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				errs[i] = applyRequest(ctx, name, fmt.Sprintf("req-%d", i))
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			Expect(err).NotTo(HaveOccurred(),
+				"concurrent apply of req-%d must succeed once conflicts are retried", i)
+		}
+		By("having allocated every usable offset exactly once")
+		fetched, err := client.MultinetworkV1alpha1().IPSlices().Get(ctx, name, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fetched.Status.Allocation).To(HaveLen(usable))
+		seenOffset := map[int32]bool{}
+		seenRequest := map[string]bool{}
+		for _, a := range fetched.Status.Allocation {
+			Expect(a.Offset).To(SatisfyAll(BeNumerically(">=", offsetLo), BeNumerically("<=", offsetHi)))
+			Expect(a.Address).To(Equal(v4Address(a.Offset)))
+			Expect(seenOffset[a.Offset]).To(BeFalse(), "offset %d handed to two requests under concurrency", a.Offset)
+			seenOffset[a.Offset] = true
+			seenRequest[a.RequestName] = true
+		}
+		Expect(seenOffset).To(HaveLen(usable), "every usable offset must be allocated exactly once")
+		Expect(seenRequest).To(HaveLen(usable), "every request must get its own allocation")
+
+		By("rejecting one more request into the now-full slice")
+		Expect(applyRequest(ctx, name, "overflow")).To(HaveOccurred(),
+			"a full slice must reject a further request even via the concurrent apply flow")
 	})
 
 	It("keeps existing allocations stable when another request is removed (no reshuffle)", func(ctx SpecContext) {

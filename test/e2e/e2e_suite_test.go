@@ -39,8 +39,16 @@ import (
 )
 
 // client is the generated IPSlice clientset, shared across specs. It is
-// initialised once in BeforeSuite against the ambient kubeconfig.
+// initialised once in BeforeSuite against the ambient kubeconfig, with the
+// default client-side rate limiter.
 var client versioned.Interface
+
+// concurrentClient is a second clientset with a raised rate limiter, used ONLY
+// by the fan-out concurrency specs. The default limiter (QPS 5, Burst 10) would
+// serialize their many simultaneous writes at the client's own token bucket and
+// hide the server-side contention they mean to exercise. Every other spec makes
+// single calls and uses the default `client`.
+var concurrentClient versioned.Interface
 
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -58,6 +66,14 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred(), "e2e needs a running cluster: could not load a kubeconfig")
 
 	client, err = versioned.NewForConfig(cfg)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Build the concurrency-only client from a copy of the same config with the
+	// rate limiter raised. Mutating cfg here does not affect the already-built
+	// `client`; NewForConfig snapshots what it needs at construction.
+	cfg.QPS = 200
+	cfg.Burst = 200
+	concurrentClient, err = versioned.NewForConfig(cfg)
 	Expect(err).NotTo(HaveOccurred())
 
 	// A CRD is not necessarily served the instant it is Established: the

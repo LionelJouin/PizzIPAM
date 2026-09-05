@@ -16,6 +16,11 @@
 verify:
 	hack/verify-all.sh
 
+.PHONY: test
+test:
+	@mkdir -p _output
+	go test $$(go list ./... | grep -v /test) -race -count=1 -coverprofile=_output/coverage.out
+
 .PHONY: e2e
 e2e:
 	go test ./test/e2e/... -v -count=1 -ginkgo.v
