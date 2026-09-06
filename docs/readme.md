@@ -114,12 +114,14 @@ one of them is load-bearing.
    so there is no per-prefix subnet-size table — the old 33-branch `2^(32-prefix)`
    ternary is gone.
 
-8. **Requests are atomic and allocation is stable.** Adding/removing an entry in
+8. **Requests are atomic and allocation is stable.** Requests are added
+   1-at-a-time and removed 1-at-a-time (enforced by the CRD schema on add and by
+   the ValidatingAdmissionPolicy on removal). Adding/removing an entry in
    `spec.request` allocates/releases at admission and returns the offset (and, for
    IPv4, the address) to the caller immediately. A kept request never changes its
    offset (immutable once assigned); a removed request drops from `.status` (freeing
    its offset), and freed offsets are reused because free selection scans the whole
-   block.
+   block via the high-performance `status.bitmap`.
 
 9. **The CRD schema is the backstop; the VAP covers what would penalize internal retries.**
    Everything expressible cheaply in the schema lives there (in `types.go`
@@ -155,6 +157,7 @@ spec:
     prefix: 192.168.0.0
     prefixLength: 26
 status:
+  bitmap: "1100000000000000000000000000000000000000000000000000000000000000"
   allocation:
   - requestName: my-request-0
     offset: 0
@@ -178,6 +181,7 @@ spec:
   - name: my-request-0
   sliceSubnet: {family: IPv6, prefix: "fe80::", prefixLength: 122}
 status:
+  bitmap: "1000000000000000000000000000000000000000000000000000000000000000"
   allocation:
   - requestName: my-request-0
     offset: 0            # consumers derive fe80::0 from (prefix, offset)

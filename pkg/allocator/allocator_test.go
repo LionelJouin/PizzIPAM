@@ -252,6 +252,60 @@ func TestAllocate(t *testing.T) {
 			wantErr:     true,
 		},
 		{
+			// IPv6 /121 walk: first /122 (2001:db8::/122) is full, so it spills
+			// into the second /122 (2001:db8::40/122).
+			name:   "IPv6 /121 walk, spills into second sub-slice (::40)",
+			client: newFakeClient(fullSlice(ref, netip.MustParsePrefix("2001:db8::/122"))),
+			ref:    ref,
+			subnet: netip.MustParsePrefix("2001:db8::/121"),
+			requestName: "test-request",
+			want:        netip.MustParseAddr("2001:db8::40"),
+			wantErr:     false,
+		},
+		{
+			// IPv6 /120 walk: first and second /122 are full, spills into third (2001:db8::80/122).
+			name: "IPv6 /120 walk, spills into third sub-slice (::80)",
+			client: newFakeClient(
+				fullSlice(ref, netip.MustParsePrefix("2001:db8::/122")),
+				fullSlice(ref, netip.MustParsePrefix("2001:db8::40/122")),
+			),
+			ref:         ref,
+			subnet:      netip.MustParsePrefix("2001:db8::/120"),
+			requestName: "test-request",
+			want:        netip.MustParseAddr("2001:db8::80"),
+			wantErr:     false,
+		},
+		{
+			// IPv6 /120 walk: first 3 are full, spills into fourth (2001:db8::c0/122).
+			name: "IPv6 /120 walk, spills into fourth sub-slice (::c0)",
+			client: newFakeClient(
+				fullSlice(ref, netip.MustParsePrefix("2001:db8::/122")),
+				fullSlice(ref, netip.MustParsePrefix("2001:db8::40/122")),
+				fullSlice(ref, netip.MustParsePrefix("2001:db8::80/122")),
+			),
+			ref:         ref,
+			subnet:      netip.MustParsePrefix("2001:db8::/120"),
+			requestName: "test-request",
+			want:        netip.MustParseAddr("2001:db8::c0"),
+			wantErr:     false,
+		},
+		{
+			// Non-zero offset in an IPv6 non-zero sub-slice (::40 with offset 5 -> ::45).
+			name: "IPv6 ::40 slice with offset 5",
+			client: newFakeClient(prefilledSlice(ref, netip.MustParsePrefix("2001:db8::40/122"),
+				v1alpha1.Allocation{RequestName: "r0", Offset: 0},
+				v1alpha1.Allocation{RequestName: "r1", Offset: 1},
+				v1alpha1.Allocation{RequestName: "r2", Offset: 2},
+				v1alpha1.Allocation{RequestName: "r3", Offset: 3},
+				v1alpha1.Allocation{RequestName: "r4", Offset: 4},
+			)),
+			ref:         ref,
+			subnet:      netip.MustParsePrefix("2001:db8::40/122"),
+			requestName: "test-request",
+			want:        netip.MustParseAddr("2001:db8::45"),
+			wantErr:     false,
+		},
+		{
 			// A subnet smaller than the fixed slice size is rejected outright.
 			name:        "subnet smaller than slice",
 			client:      newFakeClient(),
@@ -339,4 +393,47 @@ func TestAllocateRandomOrder(t *testing.T) {
 			t.Errorf("Allocate() = %v, want %v", got, second)
 		}
 	})
+}
+
+func TestIPv6AddressDerivation(t *testing.T) {
+	tests := []struct {
+		prefix string
+		offset int32
+		want   string
+	}{
+		{"2001:db8::", 0, "2001:db8::"},
+		{"2001:db8::", 5, "2001:db8::5"},
+		{"2001:db8::", 63, "2001:db8::3f"},
+		{"2001:db8::40", 0, "2001:db8::40"},
+		{"2001:db8::40", 5, "2001:db8::45"},
+		{"2001:db8::40", 63, "2001:db8::7f"},
+		{"2001:db8::80", 0, "2001:db8::80"},
+		{"2001:db8::80", 63, "2001:db8::bf"},
+		{"2001:db8::c0", 0, "2001:db8::c0"},
+		{"2001:db8::c0", 63, "2001:db8::ff"},
+		{"2001:db8::100", 0, "2001:db8::100"},
+		{"2001:db8::100", 63, "2001:db8::13f"},
+	}
+
+	ref := &v1alpha1.PodNetworkRef{Name: "test-network"}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s+offset%d", tt.prefix, tt.offset), func(t *testing.T) {
+			subnet := netip.MustParsePrefix(fmt.Sprintf("%s/122", tt.prefix))
+			var allocations []v1alpha1.Allocation
+			for i := int32(0); i < tt.offset; i++ {
+				allocations = append(allocations, v1alpha1.Allocation{
+					RequestName: fmt.Sprintf("req-%d", i),
+					Offset:      i,
+				})
+			}
+			client := newFakeClient(prefilledSlice(ref, subnet, allocations...))
+			got, err := allocator.Allocate(t.Context(), client, ref, subnet, "my-request")
+			if err != nil {
+				t.Fatalf("Allocate() failed: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Errorf("Allocate() = %s, want %s", got, tt.want)
+			}
+		})
+	}
 }

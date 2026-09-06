@@ -106,17 +106,17 @@ type IPSliceSpec struct {
 	// root rules), and MaxItems on the lists.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sliceSubnet is immutable; create a new IPSlice for a different block"
-	// +kubebuilder:validation:XValidation:rule="oldSelf != null || isIP(self.prefix)",message="sliceSubnet.prefix must be a valid IP address"
-	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || ip.isCanonical(self.prefix)",message="sliceSubnet.prefix must be in canonical form (e.g. lowercase, compressed IPv6)"
-	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || ip(self.prefix).family() == (self.family == 'IPv4' ? 4 : 6)",message="sliceSubnet.prefix family must match sliceSubnet.family"
-	// +kubebuilder:validation:XValidation:rule="oldSelf != null || (self.family == 'IPv4' ? self.prefixLength == 26 : self.prefixLength == 122)",message="slice size is fixed: prefixLength must be 26 for IPv4 or 122 for IPv6 (both are 64 addresses)"
+	// +kubebuilder:validation:XValidation:rule="isIP(self.prefix)",message="sliceSubnet.prefix must be a valid IP address"
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip.isCanonical(self.prefix)",message="sliceSubnet.prefix must be in canonical form (e.g. lowercase, compressed IPv6)"
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip(self.prefix).family() == (self.family == 'IPv4' ? 4 : 6)",message="sliceSubnet.prefix family must match sliceSubnet.family"
+	// +kubebuilder:validation:XValidation:rule="self.family == 'IPv4' ? self.prefixLength == 26 : self.prefixLength == 122",message="slice size is fixed: prefixLength must be 26 for IPv4 or 122 for IPv6 (both are 64 addresses)"
 	// The prefix length is a family-branched string LITERAL ('/26' or '/122'), not
 	// string(self.prefixLength): the CRD's static cost estimator sizes string(int)
 	// by the integer's max magnitude, which inflates the concatenated CIDR string
 	// and pushes this rule >100x over budget. prefixLength is already pinned per
 	// family (rule above), so the literal is exact and keeps the check in the CRD
 	// (where it always runs and can't be unbound) instead of a VAP.
-	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || string(cidr(self.prefix + (self.family == 'IPv4' ? '/26' : '/122')).masked().ip()) == self.prefix",message="sliceSubnet.prefix must be the network address (host bits zero) aligned to prefixLength"
+	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || string(cidr(self.prefix + (self.family == 'IPv4' ? '/26' : '/122')).masked().ip()) == self.prefix",message="sliceSubnet.prefix must be the network address (host bits zero) aligned to prefixLength"
 	SliceSubnet Subnet `json:"sliceSubnet"`
 }
 
@@ -128,6 +128,12 @@ type IPSliceStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	Allocation []Allocation `json:"allocation,omitempty"`
+
+	// Bitmap tracks offset allocation state as a 64-character string of '0' (free) and '1' (occupied).
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[01]*$`
+	Bitmap string `json:"bitmap,omitempty"`
 }
 
 // PodNetworkRef identifies a specific pod network instance.

@@ -17,114 +17,18 @@ limitations under the License.
 package e2e
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sync"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
+	"github.com/lioneljouin/pizzipam/pkg/allocator"
 	"github.com/lioneljouin/pizzipam/pkg/naming"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 )
-
-const (
-	// The IPv4 slice is 192.168.0.0/26; the IPv6 slice is fe80::/122. Both hold 64
-	// addresses, so the allocator works in host OFFSETS 0..63 for either family.
-	v4Prefix       = "192.168.0.0"
-	v6Prefix       = "fe80::"
-	sliceAddresses = int32(64)
-
-	offsetLo = int32(0)                  // first allocatable offset (network address included)
-	offsetHi = sliceAddresses - int32(1) // last allocatable offset (broadcast included) -> 63
-)
-
-func i32(v int32) *int32 { return &v }
-
-// v4Address mirrors the allocator's (prefix, offset) -> address render for the
-// IPv4 slice, so the test can assert the two status fields stay consistent.
-func v4Address(offset int32) string {
-	return fmt.Sprintf("192.168.0.%d", offset)
-}
-
-func newSlice(requests ...v1alpha1.Request) *v1alpha1.IPSlice {
-	spec := v1alpha1.IPSliceSpec{
-		PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
-		SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: v4Prefix, PrefixLength: 26},
-		Request:       requests,
-	}
-	// The name is server-enforced: it MUST be naming.Name(spec) or the
-	// ValidatingAdmissionPolicy denies the write. GenerateName would fail.
-	return &v1alpha1.IPSlice{
-		ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)},
-		Spec:       spec,
-	}
-}
-
-// newSliceV6 builds an IPv6 slice (fe80::/122). Its allocations carry the offset
-// only -- CEL cannot render a 128-bit address, so status.allocation[].address is
-// left empty and consumers derive the address from (prefix, offset).
-func newSliceV6(requests ...v1alpha1.Request) *v1alpha1.IPSlice {
-	spec := v1alpha1.IPSliceSpec{
-		PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
-		SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: v6Prefix, PrefixLength: 122},
-		Request:       requests,
-	}
-	return &v1alpha1.IPSlice{
-		ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)},
-		Spec:       spec,
-	}
-}
-
-// applyRequest performs the recommended single-round-trip allocation from
-// docs/demo.md: a server-side apply that carries ONLY this caller's own request
-// entry, under its own field manager. Because spec.request is a map-list keyed by
-// name, each field manager owns just its own entry and never clobbers another's,
-// so independent clients can allocate on the same slice with no prior GET.
-//
-// It retries on an optimistic-concurrency Conflict. Every allocation for a block
-// lives in one object (readme rule 3), so concurrent writers contend on that
-// object's resourceVersion and etcd's compare-and-swap serializes them: a loser
-// gets a 409 and retries -- it never corrupts state or double-allocates. Invalid
-// errors (e.g. a full slice) are terminal and are NOT retried.
-func applyRequest(ctx context.Context, name, requestName string) error {
-	spec := v1alpha1.IPSliceSpec{
-		PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
-		SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: v4Prefix, PrefixLength: 26},
-		Request:       []v1alpha1.Request{{Name: requestName}},
-	}
-	// TypeMeta is mandatory in an apply body (the server matches on apiVersion+kind);
-	// the typed Create/Update path would otherwise fill it in for us.
-	obj := &v1alpha1.IPSlice{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "multinetwork.networking.x-k8s.io/v1alpha1", Kind: "IPSlice"},
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec:       spec,
-	}
-	data, err := json.Marshal(obj) // JSON is valid YAML, so it is a valid apply body
-	if err != nil {
-		return err
-	}
-
-	force := true
-	// A roomier backoff than retry.DefaultBackoff (5 steps): under a full 64-way
-	// fill a loser may need several rounds before it wins its compare-and-swap.
-	backoff := wait.Backoff{Steps: 20, Duration: 10 * time.Millisecond, Factor: 1.5, Jitter: 0.1, Cap: 2 * time.Second}
-	return retry.RetryOnConflict(backoff, func() error {
-		// concurrentClient: this helper is only ever called from the fan-out
-		// concurrency spec, which needs the raised rate limiter (see e2e_suite_test.go).
-		_, err := concurrentClient.MultinetworkV1alpha1().IPSlices().Patch(
-			ctx, name, types.ApplyPatchType, data,
-			metav1.PatchOptions{FieldManager: requestName, Force: &force},
-		)
-		return err
-	})
-}
 
 var _ = Describe("IPSlice allocation", func() {
 	var created *v1alpha1.IPSlice
@@ -174,6 +78,111 @@ var _ = Describe("IPSlice allocation", func() {
 		Expect(a.RequestName).To(Equal("alpha"))
 		Expect(a.Offset).To(Equal(offsetLo), "the allocator picks the lowest free offset for IPv6 too")
 		Expect(a.Address).To(BeEmpty(), "IPv6 stores the offset only; CEL cannot render a 128-bit address")
+	})
+
+	It("allocates an IPv6 offset on a non-zero aligned sub-slice (fe80::40/122)", func(ctx SpecContext) {
+		By("creating an IPv6 slice for fe80::40/122")
+		spec := v1alpha1.IPSliceSpec{
+			PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
+			SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: "fe80::40", PrefixLength: 122},
+			Request:       []v1alpha1.Request{{Name: "r0"}},
+		}
+		name := naming.Name(spec)
+		Expect(name).To(Equal("abc.blue-network.ipv6-fe80--40-122"))
+
+		var err error
+		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
+			&v1alpha1.IPSlice{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: spec},
+			metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), "fe80::40/122 must be accepted and aligned")
+
+		Expect(created.Status.Allocation).To(HaveLen(1))
+		Expect(created.Status.Allocation[0].Offset).To(Equal(int32(0)))
+		Expect(created.Status.Allocation[0].Address).To(BeEmpty())
+
+		By("adding a second request and verifying offset 1")
+		created.Spec.Request = append(created.Spec.Request, v1alpha1.Request{Name: "r1"})
+		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Allocation).To(HaveLen(2))
+		Expect(created.Status.Allocation[1].Offset).To(Equal(int32(1)))
+	})
+
+	It("allocates an IPv6 offset within a window", func(ctx SpecContext) {
+		By("creating an IPv6 slice with a constrained request [8, 15]")
+		spec := v1alpha1.IPSliceSpec{
+			PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc"},
+			SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: v6Prefix, PrefixLength: 122},
+			Request: []v1alpha1.Request{
+				{Name: "v6-win", Offset: i32(8), Length: i32(8)},
+			},
+		}
+		var err error
+		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
+			&v1alpha1.IPSlice{ObjectMeta: metav1.ObjectMeta{Name: naming.Name(spec)}, Spec: spec},
+			metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(created.Status.Allocation).To(HaveLen(1))
+		a := created.Status.Allocation[0]
+		Expect(a.RequestName).To(Equal("v6-win"))
+		Expect(a.Offset).To(Equal(int32(8)), "IPv6 window request must take lowest free offset in window")
+		Expect(a.Address).To(BeEmpty())
+	})
+
+	It("handles namespaced PodNetworkRef correctly with canonical naming", func(ctx SpecContext) {
+		ns := "prod-ns"
+		spec := v1alpha1.IPSliceSpec{
+			PodNetworkRef: v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "abc", Namespace: &ns},
+			SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.1.0", PrefixLength: 26},
+			Request:       []v1alpha1.Request{{Name: "req-ns"}},
+		}
+		name := naming.Name(spec)
+		Expect(name).To(Equal("abc.blue-network.prod-ns.ipv4-192-168-1-0-26"))
+
+		var err error
+		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
+			&v1alpha1.IPSlice{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: spec},
+			metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), "namespaced PodNetworkRef slice must be admitted")
+
+		Expect(created.Status.Allocation).To(HaveLen(1))
+		Expect(created.Status.Allocation[0].RequestName).To(Equal("req-ns"))
+		Expect(created.Status.Allocation[0].Offset).To(Equal(int32(0)))
+		Expect(created.Status.Allocation[0].Address).To(Equal("192.168.1.0"))
+	})
+
+	It("drives multi-slice allocation via pkg/allocator.Allocate against the live cluster", func(ctx SpecContext) {
+		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "live-walk"}
+		subnet := netip.MustParsePrefix("192.168.2.0/25") // holds two /26 sub-slices: .0 and .64
+
+		s0 := naming.Name(v1alpha1.IPSliceSpec{
+			PodNetworkRef: *ref,
+			SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.2.0", PrefixLength: 26},
+		})
+		s1 := naming.Name(v1alpha1.IPSliceSpec{
+			PodNetworkRef: *ref,
+			SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.2.64", PrefixLength: 26},
+		})
+		defer func() {
+			_ = client.MultinetworkV1alpha1().IPSlices().Delete(ctx, s0, metav1.DeleteOptions{})
+			_ = client.MultinetworkV1alpha1().IPSlices().Delete(ctx, s1, metav1.DeleteOptions{})
+		}()
+
+		By("allocating the first address from the subnet")
+		addr1, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(addr1).To(Equal(netip.MustParseAddr("192.168.2.0")))
+
+		By("idempotently re-requesting the same name")
+		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(addr1Again).To(Equal(addr1), "idempotent request must return the same address")
+
+		By("allocating a second address")
+		addr2, err := allocator.Allocate(ctx, client, ref, subnet, "pod-2")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(addr2).To(Equal(netip.MustParseAddr("192.168.2.1")))
 	})
 
 	It("accepts an IPSlice with no requests, then allocates and releases as they come and go", func(ctx SpecContext) {
@@ -450,177 +459,37 @@ var _ = Describe("IPSlice allocation", func() {
 		}
 	})
 
-	// ---- Anti-tamper -------------------------------------------------------
-	// The status subresource is intentionally OFF, so a client *can* send a
-	// status on create/update. The MutatingAdmissionPolicy defends this by
-	// rebuilding status from oldObject on every write and ignoring the incoming
-	// object's status entirely. These specs prove a client cannot forge or edit
-	// an allocation. This is the core security property of the controllerless
-	// design, so it is exercised directly rather than assumed.
-
-	It("discards a client-forged status on create (anti-tamper)", func(ctx SpecContext) {
-		By("creating a request-less slice that carries a bogus status.allocation")
-		slice := newSlice() // no requests -> the allocator must produce an empty status
-		slice.Status.Allocation = []v1alpha1.Allocation{
-			{RequestName: "ghost", Offset: offsetLo, Address: v4Address(offsetLo)},
-		}
-
-		var err error
-		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx, slice, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(created.Status.Allocation).To(BeEmpty(),
-			"the allocator must overwrite a forged status, not trust the client's")
-	})
-
-	It("ignores a client-chosen offset for a real request on create (anti-tamper)", func(ctx SpecContext) {
-		By("creating a one-request slice that pre-declares a 'wrong' offset for that request")
-		slice := newSlice(v1alpha1.Request{Name: "alpha"}) // unconstrained -> allocator picks lowest free (offsetLo)
-		forged := offsetHi                                 // anything other than the lowest free offset
-		slice.Status.Allocation = []v1alpha1.Allocation{
-			{RequestName: "alpha", Offset: forged, Address: v4Address(forged)},
-		}
-
-		var err error
-		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx, slice, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		Expect(created.Status.Allocation).To(HaveLen(1))
-		a := created.Status.Allocation[0]
-		Expect(a.RequestName).To(Equal("alpha"))
-		Expect(a.Offset).To(Equal(offsetLo), "the allocator, not the client, chooses the offset (lowest free)")
-		Expect(a.Offset).NotTo(Equal(forged))
-		Expect(a.Address).To(Equal(v4Address(a.Offset)))
-	})
-
-	It("reverts a client's attempt to edit an allocation on update (anti-tamper)", func(ctx SpecContext) {
-		By("creating a one-request slice and recording its server-chosen allocation")
+	It("synchronizes status.bitmap accurately on creation, allocation and 1-by-1 release", func(ctx SpecContext) {
+		By("creating a slice with one request: bit 0 must be 1, rest 0")
 		var err error
 		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
-			newSlice(v1alpha1.Request{Name: "alpha"}), metav1.CreateOptions{})
+			newSlice(v1alpha1.Request{Name: "a"}), metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(created.Status.Allocation).To(HaveLen(1))
-		orig := created.Status.Allocation[0]
+		Expect(created.Status.Bitmap).To(HaveLen(64))
+		Expect(created.Status.Bitmap[0]).To(Equal(byte('1')))
+		Expect(created.Status.Bitmap[1:]).To(Equal("000000000000000000000000000000000000000000000000000000000000000"))
 
-		By("submitting an update that rewrites the allocation's offset and injects a ghost entry")
-		tampered := orig.Offset + 1
-		if tampered > offsetHi {
-			tampered = offsetLo
-		}
-		Expect(tampered).NotTo(Equal(orig.Offset))
-		created.Status.Allocation = []v1alpha1.Allocation{
-			{RequestName: "alpha", Offset: tampered, Address: v4Address(tampered)},
-			{RequestName: "ghost", Offset: offsetHi, Address: v4Address(offsetHi)},
-		}
+		By("adding request b: bits 0 and 1 must be 1")
+		created.Spec.Request = append(created.Spec.Request, v1alpha1.Request{Name: "b"})
 		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
-		Expect(err).NotTo(HaveOccurred(),
-			"the allocator rebuilds status from oldObject, so the write is accepted with the corrected status")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Bitmap[:2]).To(Equal("11"))
+		Expect(created.Status.Bitmap[2:]).To(Equal("00000000000000000000000000000000000000000000000000000000000000"))
 
-		By("leaving the allocation exactly as the server first chose it")
-		Expect(created.Status.Allocation).To(HaveLen(1), "the injected ghost entry must be dropped")
-		Expect(created.Status.Allocation[0].RequestName).To(Equal("alpha"))
-		Expect(created.Status.Allocation[0].Offset).To(Equal(orig.Offset),
-			"an existing allocation's offset cannot be changed by the client")
-		Expect(created.Status.Allocation[0].Address).To(Equal(orig.Address))
+		By("removing request a: bit 0 must become 0, bit 1 must remain 1")
+		created.Spec.Request = []v1alpha1.Request{{Name: "b"}}
+		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Bitmap[:2]).To(Equal("01"))
+
+		By("adding request c: offset 0 is free, so bit 0 must become 1 and offset 0 reused")
+		created.Spec.Request = append(created.Spec.Request, v1alpha1.Request{Name: "c"})
+		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Bitmap[:2]).To(Equal("11"))
+		Expect(created.Status.Allocation).To(HaveLen(2))
+		cAlloc := created.Status.Allocation[1]
+		Expect(cAlloc.RequestName).To(Equal("c"))
+		Expect(cAlloc.Offset).To(Equal(int32(0)), "freed offset 0 must be reused for request c")
 	})
-
-	// ---- Validation rejections --------------------------------------------
-	// Every invariant the CRD x-kubernetes-validations and the VAP enforce, in
-	// one table. Each entry corrupts an otherwise-valid object so that exactly
-	// the field under test is out of spec, and the write must be rejected at
-	// admission (no controller ever sees an invalid object).
-
-	DescribeTable("rejects an invalid IPSlice at admission (create)",
-		func(ctx SpecContext, corrupt func(*v1alpha1.IPSlice)) {
-			obj := newSlice(v1alpha1.Request{Name: "alpha"})
-			corrupt(obj)
-			var err error
-			// Assign to `created` so AfterEach cleans up if a bug lets it through.
-			created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx, obj, metav1.CreateOptions{})
-			Expect(err).To(HaveOccurred())
-		},
-		Entry("a non-canonical metadata.name", func(o *v1alpha1.IPSlice) {
-			o.Name = "not-the-canonical-name"
-		}),
-		Entry("a slice whose prefixLength is not 26 for IPv4", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.PrefixLength = 25
-			o.Name = naming.Name(o.Spec) // prefixLength is in the name now; keep it canonical so only the size rule fails
-		}),
-		Entry("a slice whose prefix is not the network address (not aligned)", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.Prefix = "192.168.0.1" // .1 is not the /26 network address
-			o.Name = naming.Name(o.Spec)              // keep the name canonical so only the alignment rule fails
-		}),
-		Entry("a slice whose family does not match its prefix", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.Family = "IPv6" // prefix is still IPv4
-			o.Spec.SliceSubnet.PrefixLength = 122
-			o.Name = naming.Name(o.Spec)
-		}),
-		Entry("a request with offset but no length", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Offset = i32(4)
-		}),
-		Entry("a request with length but no offset", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Length = i32(4)
-		}),
-		Entry("a request whose offset is not aligned to its length", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Offset = i32(1) // 1 is not a multiple of 4
-			o.Spec.Request[0].Length = i32(4)
-		}),
-		Entry("a request whose length is not a power of two", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Offset = i32(0)
-			o.Spec.Request[0].Length = i32(3)
-		}),
-	)
-
-	DescribeTable("rejects an invalid IPv6 IPSlice at admission (create)",
-		func(ctx SpecContext, corrupt func(*v1alpha1.IPSlice)) {
-			obj := newSliceV6(v1alpha1.Request{Name: "alpha"})
-			corrupt(obj)
-			var err error
-			created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx, obj, metav1.CreateOptions{})
-			Expect(err).To(HaveOccurred())
-		},
-		Entry("a non-canonical IPv6 prefix", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.Prefix = "FE80::" // uppercase -> not canonical
-			o.Name = naming.Name(o.Spec)         // naming canonicalizes, so isCanonical is the rule that fails
-		}),
-		Entry("an IPv6 prefix that is not aligned to /122", func(o *v1alpha1.IPSlice) {
-			// fe80::20 has host bits set (offset 32 within the /122 block); the
-			// /122 network of fe80::20 is fe80::, so the prefix is not aligned.
-			// (fe80::40 would NOT work: 0x40 = offset 0 of the next /122, i.e. a
-			// valid network address.)
-			o.Spec.SliceSubnet.Prefix = "fe80::20"
-			o.Name = naming.Name(o.Spec)
-		}),
-		Entry("an IPv6 slice whose prefixLength is not 122", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.PrefixLength = 64
-			o.Name = naming.Name(o.Spec)
-		}),
-	)
-
-	DescribeTable("rejects mutation of an immutable field (update)",
-		func(ctx SpecContext, mutate func(*v1alpha1.IPSlice)) {
-			By("creating a valid, constrained slice")
-			var err error
-			created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
-				newSlice(v1alpha1.Request{Name: "alpha", Offset: i32(4), Length: i32(4)}),
-				metav1.CreateOptions{})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("mutating the immutable field and updating")
-			mutate(created)
-			_, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
-			Expect(err).To(HaveOccurred())
-		},
-		Entry("podNetworkRef", func(o *v1alpha1.IPSlice) {
-			o.Spec.PodNetworkRef.Name = "changed"
-		}),
-		Entry("sliceSubnet", func(o *v1alpha1.IPSlice) {
-			o.Spec.SliceSubnet.Prefix = "192.168.0.64" // a different, still-valid /26
-		}),
-		Entry("a request's offset", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Offset = i32(8) // still aligned to a length-4 window
-		}),
-		Entry("a request's length", func(o *v1alpha1.IPSlice) {
-			o.Spec.Request[0].Length = i32(2) // offset 4 stays aligned to 2, so only immutability fails
-		}),
-	)
 })

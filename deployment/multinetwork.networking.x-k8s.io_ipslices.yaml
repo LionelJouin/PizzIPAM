@@ -223,22 +223,21 @@ spec:
                     block
                   rule: self == oldSelf
                 - message: sliceSubnet.prefix must be a valid IP address
-                  rule: oldSelf != null || isIP(self.prefix)
+                  rule: isIP(self.prefix)
                 - message: sliceSubnet.prefix must be in canonical form (e.g. lowercase,
                     compressed IPv6)
-                  rule: oldSelf != null || !isIP(self.prefix) || ip.isCanonical(self.prefix)
+                  rule: '!isIP(self.prefix) || ip.isCanonical(self.prefix)'
                 - message: sliceSubnet.prefix family must match sliceSubnet.family
-                  rule: 'oldSelf != null || !isIP(self.prefix) || ip(self.prefix).family()
-                    == (self.family == ''IPv4'' ? 4 : 6)'
+                  rule: '!isIP(self.prefix) || ip(self.prefix).family() == (self.family
+                    == ''IPv4'' ? 4 : 6)'
                 - message: 'slice size is fixed: prefixLength must be 26 for IPv4
                     or 122 for IPv6 (both are 64 addresses)'
-                  rule: 'oldSelf != null || (self.family == ''IPv4'' ? self.prefixLength
-                    == 26 : self.prefixLength == 122)'
+                  rule: 'self.family == ''IPv4'' ? self.prefixLength == 26 : self.prefixLength
+                    == 122'
                 - message: sliceSubnet.prefix must be the network address (host bits
                     zero) aligned to prefixLength
-                  rule: 'oldSelf != null || !isIP(self.prefix) || string(cidr(self.prefix
-                    + (self.family == ''IPv4'' ? ''/26'' : ''/122'')).masked().ip())
-                    == self.prefix'
+                  rule: '!isIP(self.prefix) || string(cidr(self.prefix + (self.family
+                    == ''IPv4'' ? ''/26'' : ''/122'')).masked().ip()) == self.prefix'
             required:
             - podNetworkRef
             - sliceSubnet
@@ -284,6 +283,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - requestName
                 x-kubernetes-list-type: map
+              bitmap:
+                description: Bitmap tracks offset allocation state as a 64-character
+                  string of '0' (free) and '1' (occupied).
+                maxLength: 64
+                pattern: ^[01]*$
+                type: string
             type: object
         type: object
         x-kubernetes-validations:

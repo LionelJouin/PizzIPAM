@@ -62,14 +62,14 @@ spec:
         variables.sliceId
     message: "metadata.name must be the canonical name for this block's identity (see pkg/naming.Name); it is derived, not chosen"
     reason: Invalid
-  # 2. For IPv4, status.allocation[].address must be the dotted render of
-  #    (prefix, offset). Defense in depth against a bypass of the allocator. IPv6
-  #    stores no address (has(a.address) is false), so it is skipped there.
+  # 2. Address render invariant:
+  #    - For IPv4: allocation.address MUST be present and match the dotted render of (prefix, offset).
+  #    - For IPv6: allocation.address MUST be omitted (consumers derive address from prefix + offset).
   - expression: >-
-      variables.allocs.all(a,
-        !has(a.address) ||
-        a.address == (variables.v4base + string(variables.v4lastOctet + a.offset)))
-    message: "allocation.address does not match the render of (prefix, offset)"
+      object.spec.sliceSubnet.family == "IPv4"
+        ? variables.allocs.all(a, has(a.address) && a.address == (variables.v4base + string(variables.v4lastOctet + a.offset)))
+        : variables.allocs.all(a, !has(a.address) || a.address == "")
+    message: "allocation.address invalid (IPv4 requires rendered address matching prefix+offset; IPv6 must omit address)"
     reason: Invalid
   # 3. No duplicate offset in status.allocation. Moved from CRD to VAP so it only
   #    runs once on admission rather than on every internal storage retry.
@@ -98,6 +98,12 @@ spec:
       !has(object.spec.request) ||
       object.spec.request.all(r, r.name in variables.allocNames)
     message: "every spec.request must be allocated in status"
+    reason: Invalid
+  # 7. At most one request may be removed in a single write.
+  - expression: >-
+      oldObject == null || !has(oldObject.spec.request) ||
+      size(oldObject.spec.request.filter(r, !(r.name in (has(object.spec.request) ? object.spec.request.map(x, x.name) : [])))) <= 1
+    message: "at most one request may be removed in a single write"
     reason: Invalid
 ---
 apiVersion: admissionregistration.k8s.io/v1

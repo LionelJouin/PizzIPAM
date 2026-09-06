@@ -63,93 +63,100 @@ spec:
   # Keep only allocations whose request is still present -> removals are released.
   - name: kept
     expression: >-
-      variables.existing.filter(a, a.requestName in variables.reqNames)
-  # The load-bearing set is OFFSETS, not absolute addresses.
-  - name: usedOffsets
-    expression: "variables.kept.map(a, a.offset)"
+      oldObject == null ? [] : variables.existing.filter(a, a.requestName in variables.reqNames)
+  - name: removed
+    expression: >-
+      (oldObject == null || size(variables.kept) == size(variables.existing))
+        ? []
+        : variables.existing.filter(a, !(a.requestName in variables.reqNames))
   - name: keptNames
     expression: "variables.kept.map(a, a.requestName)"
   # Requests still needing an address, in declared order.
   - name: pending
     expression: >-
-      variables.requests.filter(r, !(r.name in variables.keptNames))
+      oldObject == null
+        ? variables.requests
+        : (size(variables.requests) == size(variables.kept)
+            ? []
+            : variables.requests.filter(r, !(r.name in variables.keptNames)))
   - name: have
     expression: "size(variables.pending) > 0"
   # Whether the first pending request narrowed to an offset window.
   - name: constrained
     expression: "variables.have && has(variables.pending[0].offset)"
-  # Allocation window as an OFFSET range [wlo, whi] within the slice. No subnet
-  # size table: the client passes `length` directly (the CRD checks it is a power
-  # of two, aligned, and fits) -- the 33-branch 2^(32-prefix) ternary is gone.
+  # Allocation window as an OFFSET range [wlo, whi] within the slice.
   - name: wlo
     expression: "variables.constrained ? variables.pending[0].offset : 0"
   - name: whi
     expression: >-
       variables.constrained
         ? variables.pending[0].offset + variables.pending[0].length - 1
-        : variables.space - 1
-  # Bounded offset list to enumerate the slice's addresses. It matches the fixed
-  # slice size (`space` = 64) exactly: freeList filters `o < space`, so any entry
-  # >= 64 is always discarded, and carrying such dead entries only makes the
-  # freeList filter (re-run on every admission pass, including the apiserver's
-  # internal conflict retries) do needless work. If the fixed size ever grows,
-  # extend this list to match `space`.
-  - name: offsets
+        : 63
+  # Base bitmap from oldObject or default 64 zeroes.
+  - name: rawOldBitmap
     expression: >-
-      [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-       16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-       32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
-       48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]
-  # Fast-path detection: whether allocation needs a full filter scan (window constraint or released holes).
-  - name: hasHoles
+      (oldObject != null && has(oldObject.status) && has(oldObject.status.bitmap) && size(oldObject.status.bitmap) == 64)
+        ? oldObject.status.bitmap
+        : "0000000000000000000000000000000000000000000000000000000000000000"
+  # If an allocation was removed, clear its bit in the bitmap (1-by-1 release).
+  - name: clearedBitmap
     expression: >-
-      variables.constrained ||
-      (size(variables.usedOffsets) > 0 &&
-       variables.usedOffsets[size(variables.usedOffsets) - 1] != size(variables.usedOffsets) - 1)
-  # Free offsets: fast O(1) contiguous index when no holes exist, full filter scan otherwise.
-  - name: freeList
+      size(variables.removed) > 0
+        ? (variables.rawOldBitmap.substring(0, variables.removed[0].offset) + "0" + variables.rawOldBitmap.substring(variables.removed[0].offset + 1))
+        : variables.rawOldBitmap
+  # Pick free offset using sub-microsecond string search.
+  - name: pick
     expression: >-
-      variables.hasHoles
-        ? (variables.constrained
-            ? variables.offsets.filter(o, o >= variables.wlo && o <= variables.whi && !(o in variables.usedOffsets))
-            : variables.offsets.filter(o, !(o in variables.usedOffsets)))
-        : (size(variables.usedOffsets) < variables.space ? [size(variables.usedOffsets)] : [])
+      variables.constrained
+        ? variables.clearedBitmap.indexOf("0", variables.wlo)
+        : variables.clearedBitmap.indexOf("0")
+  # Room check: must be >= 0 and within window.
+  - name: room
+    expression: >-
+      variables.have && variables.pick >= 0 && (!variables.constrained || variables.pick <= variables.whi)
+  # Updated bitmap with bit 'pick' set to '1'.
+  - name: newBitmap
+    expression: >-
+      variables.room
+        ? (variables.clearedBitmap.substring(0, variables.pick) + "1" + variables.clearedBitmap.substring(variables.pick + 1))
+        : variables.clearedBitmap
   # IPv4 display address base and last octet prefix: precomputed once so map expressions
   # avoid repeated string splits and type conversions.
   - name: v4parts
-    expression: "object.spec.sliceSubnet.prefix.split('.')"
+    expression: "object.spec.sliceSubnet.family == 'IPv4' ? object.spec.sliceSubnet.prefix.split('.') : []"
   - name: v4base
-    expression: "variables.v4parts[0] + '.' + variables.v4parts[1] + '.' + variables.v4parts[2] + '.'"
+    expression: "size(variables.v4parts) == 4 ? variables.v4parts[0] + '.' + variables.v4parts[1] + '.' + variables.v4parts[2] + '.' : ''"
   - name: v4lastOctet
-    expression: "int(variables.v4parts[3])"
+    expression: "size(variables.v4parts) == 4 ? int(variables.v4parts[3]) : 0"
   mutations:
   - patchType: JSONPatch
     jsonPatch:
       # Rebuild the whole status. Branch on family: IPv4 entries carry a rendered
       # `address`; IPv6 entries carry only the `offset` (CEL cannot render a
-      # 128-bit address). Each branch keeps the surviving allocations plus all
-      # pending requests mapped to freeList offsets.
+      # 128-bit address). Each branch keeps the surviving allocations plus the
+      # newly allocated offset and updated bitmap.
       expression: >-
         [
           JSONPatch{
             op: "add",
             path: "/status",
             value: Object.status{
+              bitmap: variables.newBitmap,
               allocation:
                 object.spec.sliceSubnet.family == "IPv4"
                 ? (variables.kept
-                   + (variables.have && size(variables.freeList) > 0
+                   + (variables.room
                      ? [Object.status.allocation{
                          requestName: variables.pending[0].name,
-                         offset: variables.freeList[0],
-                         address: variables.v4base + string(variables.v4lastOctet + variables.freeList[0])
+                         offset: variables.pick,
+                         address: variables.v4base + string(variables.v4lastOctet + variables.pick)
                        }]
                      : []))
                 : (variables.kept
-                   + (variables.have && size(variables.freeList) > 0
+                   + (variables.room
                      ? [Object.status.allocation{
                          requestName: variables.pending[0].name,
-                         offset: variables.freeList[0]
+                         offset: variables.pick
                        }]
                      : []))
             }
