@@ -108,6 +108,11 @@ func newFakeClient(objects ...runtime.Object) versioned.Interface {
 				Offset:      off,
 			})
 		}
+		if _, err := cs.Tracker().Get(ipsliceGVR, pa.GetNamespace(), pa.GetName()); err != nil {
+			_ = cs.Tracker().Create(ipsliceGVR, result, pa.GetNamespace())
+		} else {
+			_ = cs.Tracker().Update(ipsliceGVR, result, pa.GetNamespace())
+		}
 		return true, result, nil
 	})
 	return cs
@@ -436,4 +441,62 @@ func TestIPv6AddressDerivation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRelease(t *testing.T) {
+	ref := &v1alpha1.PodNetworkRef{Name: "test-network"}
+	subnet := netip.MustParsePrefix("192.168.0.0/26")
+
+	t.Run("release with WithRequestName", func(t *testing.T) {
+		ip := netip.MustParseAddr("192.168.0.5")
+		client := newFakeClient(prefilledSlice(ref, subnet, v1alpha1.Allocation{
+			RequestName: "pod-5",
+			Offset:      5,
+		}))
+
+		err := allocator.Release(t.Context(), client, ref, ip, allocator.WithRequestName("pod-5"))
+		if err != nil {
+			t.Fatalf("Release() failed: %v", err)
+		}
+	})
+
+	t.Run("release without request name looks up allocation", func(t *testing.T) {
+		ip := netip.MustParseAddr("192.168.0.5")
+		client := newFakeClient(prefilledSlice(ref, subnet, v1alpha1.Allocation{
+			RequestName: "pod-5",
+			Offset:      5,
+		}))
+
+		err := allocator.Release(t.Context(), client, ref, ip)
+		if err != nil {
+			t.Fatalf("Release() failed: %v", err)
+		}
+	})
+
+	t.Run("release IPv6 address", func(t *testing.T) {
+		v6Ref := &v1alpha1.PodNetworkRef{Name: "v6-network"}
+		v6Subnet := netip.MustParsePrefix("2001:db8::40/122")
+		ip := netip.MustParseAddr("2001:db8::45")
+		client := newFakeClient(prefilledSlice(v6Ref, v6Subnet, v1alpha1.Allocation{
+			RequestName: "v6-pod",
+			Offset:      5,
+		}))
+
+		err := allocator.Release(t.Context(), client, v6Ref, ip, allocator.WithRequestName("v6-pod"))
+		if err != nil {
+			t.Fatalf("Release() failed: %v", err)
+		}
+	})
+
+	t.Run("invalid inputs", func(t *testing.T) {
+		client := newFakeClient()
+		ip := netip.MustParseAddr("192.168.0.1")
+
+		if err := allocator.Release(t.Context(), client, nil, ip); err == nil {
+			t.Error("Release() with nil ref expected error")
+		}
+		if err := allocator.Release(t.Context(), client, ref, netip.Addr{}); err == nil {
+			t.Error("Release() with invalid IP expected error")
+		}
+	})
 }

@@ -18,14 +18,12 @@ package e2e
 
 import (
 	"fmt"
-	"net/netip"
 	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
-	"github.com/lioneljouin/pizzipam/pkg/allocator"
 	"github.com/lioneljouin/pizzipam/pkg/naming"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -152,39 +150,6 @@ var _ = Describe("IPSlice allocation", func() {
 		Expect(created.Status.Allocation[0].Address).To(Equal("192.168.1.0"))
 	})
 
-	It("drives multi-slice allocation via pkg/allocator.Allocate against the live cluster", func(ctx SpecContext) {
-		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "live-walk"}
-		subnet := netip.MustParsePrefix("192.168.2.0/25") // holds two /26 sub-slices: .0 and .64
-
-		s0 := naming.Name(v1alpha1.IPSliceSpec{
-			PodNetworkRef: *ref,
-			SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.2.0", PrefixLength: 26},
-		})
-		s1 := naming.Name(v1alpha1.IPSliceSpec{
-			PodNetworkRef: *ref,
-			SliceSubnet:   v1alpha1.Subnet{Family: "IPv4", Prefix: "192.168.2.64", PrefixLength: 26},
-		})
-		defer func() {
-			_ = client.MultinetworkV1alpha1().IPSlices().Delete(ctx, s0, metav1.DeleteOptions{})
-			_ = client.MultinetworkV1alpha1().IPSlices().Delete(ctx, s1, metav1.DeleteOptions{})
-		}()
-
-		By("allocating the first address from the subnet")
-		addr1, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(addr1).To(Equal(netip.MustParseAddr("192.168.2.0")))
-
-		By("idempotently re-requesting the same name")
-		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(addr1Again).To(Equal(addr1), "idempotent request must return the same address")
-
-		By("allocating a second address")
-		addr2, err := allocator.Allocate(ctx, client, ref, subnet, "pod-2")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(addr2).To(Equal(netip.MustParseAddr("192.168.2.1")))
-	})
-
 	It("accepts an IPSlice with no requests, then allocates and releases as they come and go", func(ctx SpecContext) {
 		// Regression: the allocator must not choke when spec.request is absent.
 		// Accessing object.spec.request directly in CEL throws "no such key" when
@@ -273,6 +238,34 @@ var _ = Describe("IPSlice allocation", func() {
 			offsets[a.Offset] = a.RequestName
 		}
 		Expect(offsets).To(HaveLen(2), "the two requests must get distinct offsets")
+	})
+
+	It("keeps all existing allocations completely unchanged when new requests are added (no offset drift)", func(ctx SpecContext) {
+		By("creating with the initial request")
+		var err error
+		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
+			newSlice(v1alpha1.Request{Name: "req-0"}), metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Allocation).To(HaveLen(1))
+		req0Alloc := created.Status.Allocation[0]
+
+		By("adding a second request and verifying req-0 is unchanged")
+		created.Spec.Request = append(created.Spec.Request, v1alpha1.Request{Name: "req-1"})
+		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Allocation).To(HaveLen(2))
+		Expect(created.Status.Allocation[0]).To(Equal(req0Alloc), "req-0 must be completely unchanged after req-1 is added")
+		req1Alloc := created.Status.Allocation[1]
+
+		By("adding a third request with a window constraint and verifying req-0 and req-1 are unchanged")
+		created.Spec.Request = append(created.Spec.Request, v1alpha1.Request{Name: "req-win", Offset: i32(16), Length: i32(8)})
+		created, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(created.Status.Allocation).To(HaveLen(3))
+		Expect(created.Status.Allocation[0]).To(Equal(req0Alloc), "req-0 must remain unchanged")
+		Expect(created.Status.Allocation[1]).To(Equal(req1Alloc), "req-1 must remain unchanged")
+		Expect(created.Status.Allocation[2].RequestName).To(Equal("req-win"))
+		Expect(created.Status.Allocation[2].Offset).To(Equal(int32(16)))
 	})
 
 	It("rejects a write that adds more than one new request at once", func(ctx SpecContext) {

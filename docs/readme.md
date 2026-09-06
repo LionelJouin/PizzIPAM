@@ -232,7 +232,7 @@ This design is optimized for **spread allocation**: many independent callers eac
 land in a *different* slice object. There every write is a lone writer on its own
 object, admission runs once, and there is no contention — so throughput is high
 and flat. In benchmarking against a real cluster this is roughly **~100× a
-locking, single-pool-object allocator (whereabouts)**: e.g. ~1600 alloc/s
+locking, single-pool-object allocator**: e.g. ~1600 alloc/s
 concurrent into a large fixed pool, versus ~10 alloc/s.
 
 There is one workload where it does the opposite — **concurrently filling a pool
@@ -253,9 +253,8 @@ With our $O(1)$ CRD size checks, VAP validation deferrals, in-tree bitmap
 allocation, and anti-wave Full Jitter client hopping, PizzIPAM absorbs this burst
 cleanly:
 - **Zero Dropouts:** Completes 100% of allocations with **0 errors and 0 misses**.
-- **Outperforms Whereabouts:** Under a 100% concurrent burst of 1,024 IPs into a tight
-  `/22` pool, PizzIPAM finishes in **~41 seconds (~25 alloc/s)** — more than **2.5×
-  faster than Whereabouts' 107 seconds**, without any distributed lease locks.
+- **High Throughput under Contention:** Under a 100% concurrent burst of 1,024 IPs into a tight
+  `/22` pool, PizzIPAM finishes in **~41 seconds (~25 alloc/s)**, without any distributed lease locks.
 - **CPU Efficient:** Rebuilding and searching status via `status.bitmap` keeps API
   server CPU low even during retry loops.
 

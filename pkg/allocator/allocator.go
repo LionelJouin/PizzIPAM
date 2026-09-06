@@ -165,9 +165,11 @@ type options struct {
 	// retry enables the transient-error retry (see isRetryable). Defaulted to
 	// true in Allocate; WithRetry(false) turns it off.
 	retry bool
+	// requestName is the field-manager / request identifier used for release.
+	requestName string
 }
 
-// Option customizes an Allocate call.
+// Option customizes an Allocate or Release call.
 type Option func(*options)
 
 // WithOrder selects the sub-slice walk order for a subnet larger than one slice.
@@ -186,6 +188,11 @@ func WithRand(r *rand.Rand) Option { return func(op *options) { op.rng = r } }
 // error instead, e.g. when the caller would rather give up (or try elsewhere)
 // than wait out a saturated apiserver.
 func WithRetry(enabled bool) Option { return func(op *options) { op.retry = enabled } }
+
+// WithRequestName specifies the request name and field manager when releasing an IP.
+// When provided to Release, it enables an immediate single server-side apply round-trip
+// without needing a prior GET to discover which request owns the IP.
+func WithRequestName(name string) Option { return func(op *options) { op.requestName = name } }
 
 // visitOrder returns the sub-slice indices [0,n) in the order Allocate should
 // try them: ascending for Sequential, a random permutation for Random.
@@ -342,6 +349,111 @@ func Allocate(
 		case <-time.After(outerBackoff.Step()):
 		}
 	}
+}
+
+// Release frees an allocated IP address from its IPSlice.
+//
+// The slice holding the address is determined deterministically from (networkRef, ip).
+// When WithRequestName("name") is provided, Release issues a single server-side apply
+// without a prior GET to remove the request under its field manager. If no request
+// name is given, Release performs a single GET to look up which request owns the
+// IP's offset before releasing it.
+func Release(
+	ctx context.Context,
+	client versioned.Interface,
+	networkRef *v1alpha1.PodNetworkRef,
+	ip netip.Addr,
+	opts ...Option,
+) error {
+	opt := options{retry: true}
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	if networkRef == nil {
+		return errors.New("networkRef must not be nil")
+	}
+	if !ip.IsValid() {
+		return errors.New("ip must be a valid address")
+	}
+
+	base := ip.Unmap()
+	family := "IPv4"
+	sliceBits := 26
+	if !base.Is4() {
+		family = "IPv6"
+		sliceBits = 122
+	}
+
+	slice := netip.PrefixFrom(base, sliceBits).Masked()
+	offset := offsetForAddr(slice.Addr(), base)
+
+	spec := v1alpha1.IPSliceSpec{
+		PodNetworkRef: *networkRef,
+		SliceSubnet: v1alpha1.Subnet{
+			Family:       family,
+			Prefix:       slice.Addr().String(),
+			PrefixLength: int32(sliceBits),
+		},
+	}
+	name := naming.Name(spec)
+
+	reqName := opt.requestName
+	if reqName == "" {
+		sliceObj, err := client.MultinetworkV1alpha1().IPSlices().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil // slice does not exist -> already released
+			}
+			return fmt.Errorf("get IPSlice %q to resolve request for IP %s: %w", name, ip, err)
+		}
+		for _, a := range sliceObj.Status.Allocation {
+			if a.Offset == offset {
+				reqName = a.RequestName
+				break
+			}
+		}
+		if reqName == "" {
+			return nil // IP offset is not currently allocated -> nothing to release
+		}
+	}
+
+	spec.Request = nil
+	obj := &v1alpha1.IPSlice{
+		TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.GroupVersion.String(), Kind: "IPSlice"},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       spec,
+	}
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("marshal apply body: %w", err)
+	}
+
+	force := true
+	apply := func() error {
+		_, applyErr := client.MultinetworkV1alpha1().IPSlices().Patch(
+			ctx, name, types.ApplyPatchType, data,
+			metav1.PatchOptions{FieldManager: reqName, Force: &force},
+		)
+		return applyErr
+	}
+	if opt.retry {
+		err = retry.OnError(retryBackoff, isRetryable, apply)
+	} else {
+		err = apply()
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("release IP %s on IPSlice %q: %w", ip, name, err)
+	}
+	return nil
+}
+
+// offsetForAddr returns the host offset of addr within a slice network address prefix.
+func offsetForAddr(prefix, addr netip.Addr) int32 {
+	if addr.Is4() {
+		return int32(addr.As4()[3] - prefix.As4()[3])
+	}
+	return int32(addr.As16()[15] - prefix.As16()[15])
 }
 
 // allocateSlice performs the single self-describing round-trip against one

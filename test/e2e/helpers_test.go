@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"time"
 
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
@@ -47,6 +48,22 @@ func i32(v int32) *int32 { return &v }
 // IPv4 slice, so the test can assert the two status fields stay consistent.
 func v4Address(offset int32) string {
 	return fmt.Sprintf("192.168.0.%d", offset)
+}
+
+// addAddr computes addr + delta across the full 16-byte address.
+func addAddr(addr netip.Addr, delta uint64) netip.Addr {
+	b := addr.As16()
+	carry := delta
+	for i := 15; i >= 0 && carry > 0; i-- {
+		carry += uint64(b[i])
+		b[i] = byte(carry)
+		carry >>= 8
+	}
+	out := netip.AddrFrom16(b)
+	if addr.Is4() {
+		out = out.Unmap()
+	}
+	return out
 }
 
 func newSlice(requests ...v1alpha1.Request) *v1alpha1.IPSlice {
