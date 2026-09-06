@@ -24,20 +24,36 @@ spec:
       resources:   ["ipslices"]
   variables:
   # sliceId is the family-agnostic block identity encoded in the name:
-  # "<family-lower>-<sanitized-canonical-prefix>-<prefixLength>". The prefix is
-  # canonical (the CRD enforces ip.isCanonical), so replacing "." and ":" with "-"
-  # yields one token per network. MUST match pkg/naming.Name() byte-for-byte.
+  # "<family-lower>-<sanitized-canonical-prefix>-<prefixLength>". Only computed
+  # on CREATE since metadata.name and identity fields are immutable.
   - name: sliceId
     expression: >-
-      object.spec.sliceSubnet.family.lowerAscii() + "-" +
-      object.spec.sliceSubnet.prefix.replace(".", "-").replace(":", "-") + "-" +
-      string(object.spec.sliceSubnet.prefixLength)
+      oldObject != null ? "" :
+      (object.spec.sliceSubnet.family.lowerAscii() + "-" +
+       object.spec.sliceSubnet.prefix.replace(".", "-").replace(":", "-") + "-" +
+       string(object.spec.sliceSubnet.prefixLength))
+  - name: allocs
+    expression: >-
+      (has(object.status) && has(object.status.allocation)) ? object.status.allocation : []
+  - name: allocOffsets
+    expression: "variables.allocs.map(a, a.offset)"
+  - name: allocNames
+    expression: "variables.allocs.map(a, a.requestName)"
+  - name: v4parts
+    expression: >-
+      object.spec.sliceSubnet.family == "IPv4" ? object.spec.sliceSubnet.prefix.split(".") : []
+  - name: v4base
+    expression: >-
+      size(variables.v4parts) == 4 ? variables.v4parts[0] + "." + variables.v4parts[1] + "." + variables.v4parts[2] + "." : ""
+  - name: v4lastOctet
+    expression: "size(variables.v4parts) == 4 ? int(variables.v4parts[3]) : 0"
   validations:
   # 1. metadata.name MUST be the canonical name for the block identity. Each
   #    identity has exactly one legal name, so a wrong name is denied and a second
   #    object for the same block collides on create -> never two objects for one
-  #    block, and clients cannot invent names.
+  #    block, and clients cannot invent names. (Skipped on UPDATE since name is immutable).
   - expression: >-
+      oldObject != null ||
       object.metadata.name ==
         object.spec.podNetworkRef.name + "." +
         object.spec.podNetworkRef.kind +
@@ -50,15 +66,38 @@ spec:
   #    (prefix, offset). Defense in depth against a bypass of the allocator. IPv6
   #    stores no address (has(a.address) is false), so it is skipped there.
   - expression: >-
-      !has(object.status) || !has(object.status.allocation) ||
-      object.status.allocation.all(a,
+      variables.allocs.all(a,
         !has(a.address) ||
-        a.address == (
-          object.spec.sliceSubnet.prefix.split(".")[0] + "." +
-          object.spec.sliceSubnet.prefix.split(".")[1] + "." +
-          object.spec.sliceSubnet.prefix.split(".")[2] + "." +
-          string(int(object.spec.sliceSubnet.prefix.split(".")[3]) + a.offset)))
+        a.address == (variables.v4base + string(variables.v4lastOctet + a.offset)))
     message: "allocation.address does not match the render of (prefix, offset)"
+    reason: Invalid
+  # 3. No duplicate offset in status.allocation. Moved from CRD to VAP so it only
+  #    runs once on admission rather than on every internal storage retry.
+  - expression: >-
+      variables.allocOffsets.all(o, size(variables.allocOffsets.filter(x, x == o)) == 1)
+    message: "duplicate offset in status.allocation"
+    reason: Invalid
+  # 4. An existing allocation offset cannot change.
+  - expression: >-
+      oldObject == null || !has(oldObject.status) || !has(oldObject.status.allocation) ||
+      oldObject.status.allocation.all(o,
+        !(has(object.spec.request) && object.spec.request.exists(r, r.name == o.requestName)) ||
+        (has(object.status) && has(object.status.allocation) &&
+         object.status.allocation.exists(a, a.requestName == o.requestName && a.offset == o.offset)))
+    message: "an existing allocation offset cannot change (only released by removing its request)"
+    reason: Invalid
+  # 5. An allocated offset lies inside its request's window.
+  - expression: >-
+      variables.allocs.all(a,
+        object.spec.request.exists(r, r.name == a.requestName &&
+          (!has(r.offset) || (a.offset >= r.offset && a.offset < r.offset + r.length))))
+    message: "an allocated offset is outside its request's window"
+    reason: Invalid
+  # 6. Every spec.request matches an allocation in status.allocation.
+  - expression: >-
+      !has(object.spec.request) ||
+      object.spec.request.all(r, r.name in variables.allocNames)
+    message: "every spec.request must be allocated in status"
     reason: Invalid
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -121,25 +121,18 @@ one of them is load-bearing.
    its offset), and freed offsets are reused because free selection scans the whole
    block.
 
-9. **The CRD schema is the backstop; the VAP covers only what it can't.**
+9. **The CRD schema is the backstop; the VAP covers what would penalize internal retries.**
    Everything expressible cheaply in the schema lives there (in `types.go`
-   markers), not in a policy: field ranges and list caps, immutability of the
-   block-identity fields (`self == oldSelf`), the prefix validity / canonicality
-   (`ip.isCanonical`) / family-match / alignment checks (via the IP and CIDR CEL
-   libraries), and object-level CEL (`x-kubernetes-validations`) for every request
-   allocated, no orphan allocation, offsets in range, no duplicate offset, no
-   existing offset changed, and the allocated offset lying inside its request
-   window. Schema validation runs after the mutation and *always* runs (it can't be
-   unbound like a policy), so it catches any bypass. Two checks live in the
-   `ValidatingAdmissionPolicy` (`deployment/validating-policy.yaml`) instead:
-   (a) `metadata.name` equals the canonical name — the naming contract; and
-   (b) for IPv4, `address` matches the render of `(prefix, offset)`. Check (b)'s
-   natural form (`address == string(int…)`) is rejected by the CRD's *static* cost
-   estimator, which sizes `string(int)` by the integer's max value rather than its
-   digit count and so over-budgets it; in the VAP that cost is enforced at *runtime*
-   on the real octet values (0–255) and is trivial. IPv6 stores no address, so (b)
-   is skipped there. Rule of thumb: put a check in the CRD if it fits the static
-   budget; move it to a VAP only when it can't.
+   markers): field ranges and list caps, immutability of the block-identity fields
+   (`self == oldSelf`), prefix validation on create, and object-level CEL for every
+   request allocated (which signals `ErrSliceFull`), no orphan allocation, and
+   offset bounds. Heavy checks that involve $O(N^2)$ loops (duplicate offset check,
+   offset immutability verification, and window bounds checks) live in the
+   `ValidatingAdmissionPolicy` (`deployment/validating-policy.yaml`) alongside the
+   naming check and IPv4 address render verification. In Kubernetes, CRD validations
+   re-run on *every internal storage retry* of `GuaranteedUpdate`, whereas a VAP runs
+   *only once when the commit succeeds* — keeping $O(N^2)$ checks in the VAP saves
+   millions of redundant evaluations during concurrent write bursts.
 
 ## Example
 
@@ -248,8 +241,18 @@ sized to just a few slices**:
   of `S²` admission runs. Filling `M` addresses spread over `M/S` slices costs
   **≈ M·S** admission runs in total — linear in the *slice size*. With the fixed
   `S = 64` (a `/26`), a concurrent burst into a nearly-full small pool drives the
-  apiserver CPU up and, once it saturates, individual applies exceed the client's
-  request deadline and fail.
+  apiserver CPU up and individual applies exceed the storage layer's request
+  deadline (surfacing as a `504 Timeout`).
+
+The allocator absorbs those timeouts by retrying the idempotent apply (see
+`isRetryable` in `pkg/allocator/allocator.go`) — a retried request is keyed by the
+same `requestName`, so it never double-allocates — so a concurrent fill still
+*completes without errors* as long as the pool has room. But retrying does not
+lower the `M·S` cost: it converts the deadline failures into slow successes.
+Throughput degrades to roughly serial and per-request latency pins near the
+request-timeout cap. Reliability is preserved; speed is not. (Because the caller's
+context deadline governs how long the retry persists, callers must pass a bounded
+context.)
 
 This is a deliberate trade, not a bug: the single-object-per-slice model is
 exactly what buys the spread-case speed and the single-round-trip protocol. The

@@ -23,13 +23,11 @@
 #      (The status subresource is off, so RBAC cannot gate status writes; this is
 #      how we make status effectively allocator-owned instead.)
 #
-# ONE new address per write. CEL has no fold/reduce, so it cannot hand distinct
-# offsets to several NEW requests in a single pass when their windows overlap. So
-# the allocator only ever assigns the FIRST still-unallocated request, taking the
-# lowest free offset inside that request's window. If a write adds more than one
-# new request, the extras stay unallocated and the CRD's "every request allocated"
-# rule rejects the whole write -- so clients add requests one at a time (the
-# natural one-entry-per-client server-side-apply flow anyway).
+# BATCH allocation: MutatingAdmissionPolicy allocates all pending requests in a
+# single write by indexing freeList[i] for pending[i] up to available capacity.
+# Clients can allocate a single address or an entire batch of addresses (up to
+# slice capacity) in one round-trip. If there is insufficient room, unallocated
+# requests are caught by the CRD's "every request allocated" rule.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -60,19 +58,21 @@ spec:
           ? oldObject.status.allocation : [])
   - name: requests
     expression: "has(object.spec.request) ? object.spec.request : []"
+  - name: reqNames
+    expression: "variables.requests.map(r, r.name)"
   # Keep only allocations whose request is still present -> removals are released.
   - name: kept
     expression: >-
-      variables.existing.filter(a,
-        variables.requests.exists(r, r.name == a.requestName))
+      variables.existing.filter(a, a.requestName in variables.reqNames)
   # The load-bearing set is OFFSETS, not absolute addresses.
   - name: usedOffsets
     expression: "variables.kept.map(a, a.offset)"
-  # Requests still needing an address, in declared order. Only the first is served
-  # per write (see the header comment).
+  - name: keptNames
+    expression: "variables.kept.map(a, a.requestName)"
+  # Requests still needing an address, in declared order.
   - name: pending
     expression: >-
-      variables.requests.filter(r, !variables.kept.exists(a, a.requestName == r.name))
+      variables.requests.filter(r, !(r.name in variables.keptNames))
   - name: have
     expression: "size(variables.pending) > 0"
   # Whether the first pending request narrowed to an offset window.
@@ -100,34 +100,35 @@ spec:
        16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
        32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
        48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]
-  # Free offsets inside the window, ascending. The first pending request takes the
-  # lowest one.
+  # Fast-path detection: whether allocation needs a full filter scan (window constraint or released holes).
+  - name: hasHoles
+    expression: >-
+      variables.constrained ||
+      (size(variables.usedOffsets) > 0 &&
+       variables.usedOffsets[size(variables.usedOffsets) - 1] != size(variables.usedOffsets) - 1)
+  # Free offsets: fast O(1) contiguous index when no holes exist, full filter scan otherwise.
   - name: freeList
     expression: >-
-      variables.offsets.filter(o,
-        o >= variables.wlo && o <= variables.whi && o < variables.space
-        && !(o in variables.usedOffsets))
-  - name: pick       # the offset to assign (guarded by size(freeList) > 0 below)
-    expression: "size(variables.freeList) > 0 ? variables.freeList[0] : 0"
-  - name: room       # is there a free offset for the first pending request?
-    expression: "variables.have && size(variables.freeList) > 0"
-  # IPv4 display address: prefix is dotted, the slice is aligned so the last octet
-  # is a multiple of 64 and (lastOctet + offset) never carries past 255. Exact
-  # integer arithmetic on 0..255, cheap at runtime.
+      variables.hasHoles
+        ? (variables.constrained
+            ? variables.offsets.filter(o, o >= variables.wlo && o <= variables.whi && !(o in variables.usedOffsets))
+            : variables.offsets.filter(o, !(o in variables.usedOffsets)))
+        : (size(variables.usedOffsets) < variables.space ? [size(variables.usedOffsets)] : [])
+  # IPv4 display address base and last octet prefix: precomputed once so map expressions
+  # avoid repeated string splits and type conversions.
   - name: v4parts
     expression: "object.spec.sliceSubnet.prefix.split('.')"
-  - name: v4addr
-    expression: >-
-      variables.v4parts[0] + "." + variables.v4parts[1] + "." +
-      variables.v4parts[2] + "." + string(int(variables.v4parts[3]) + variables.pick)
+  - name: v4base
+    expression: "variables.v4parts[0] + '.' + variables.v4parts[1] + '.' + variables.v4parts[2] + '.'"
+  - name: v4lastOctet
+    expression: "int(variables.v4parts[3])"
   mutations:
   - patchType: JSONPatch
     jsonPatch:
       # Rebuild the whole status. Branch on family: IPv4 entries carry a rendered
       # `address`; IPv6 entries carry only the `offset` (CEL cannot render a
-      # 128-bit address). Each branch keeps the surviving allocations plus (at
-      # most) one entry for the first pending request at the lowest free offset.
-      # If there is no room the request stays unallocated and the CRD rejects.
+      # 128-bit address). Each branch keeps the surviving allocations plus all
+      # pending requests mapped to freeList offsets.
       expression: >-
         [
           JSONPatch{
@@ -136,23 +137,19 @@ spec:
             value: Object.status{
               allocation:
                 object.spec.sliceSubnet.family == "IPv4"
-                ? (variables.kept.map(a, Object.status.allocation{
-                     requestName: a.requestName, offset: a.offset, address: a.address
-                   })
-                   + (variables.room
+                ? (variables.kept
+                   + (variables.have && size(variables.freeList) > 0
                      ? [Object.status.allocation{
                          requestName: variables.pending[0].name,
-                         offset: variables.pick,
-                         address: variables.v4addr
+                         offset: variables.freeList[0],
+                         address: variables.v4base + string(variables.v4lastOctet + variables.freeList[0])
                        }]
                      : []))
-                : (variables.kept.map(a, Object.status.allocation{
-                     requestName: a.requestName, offset: a.offset
-                   })
-                   + (variables.room
+                : (variables.kept
+                   + (variables.have && size(variables.freeList) > 0
                      ? [Object.status.allocation{
                          requestName: variables.pending[0].name,
-                         offset: variables.pick
+                         offset: variables.freeList[0]
                        }]
                      : []))
             }

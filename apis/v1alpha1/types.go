@@ -42,18 +42,19 @@ import (
 // nothing here ever holds a 128-bit address.
 //
 // 1. every request is allocated; 2. no orphan allocation; 3. offset in range;
-// 4. no duplicate offset; 5. an existing offset never changes (release-only);
-// 6. a constrained request's window fits inside the slice; 7. each allocation's
-// offset lies inside its request's window. Rules 6-7 replace the old
+// 4. an existing offset never changes (release-only);
+// 5. a constrained request's window fits inside the slice; 6. each allocation's
+// offset lies inside its request's window. Rules 5-6 replace the old
 // 2^(32-prefix) ternary and disjoint-subnet check entirely -- an offset window is
 // expressed in slice offsets, so it cannot be disjoint from the slice.
-// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == r.name))",message="every spec.request must be allocated in status (add new requests one at a time, or the slice is full)"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))",message="status.allocation has an entry with no matching spec.request"
+// 1. every request is allocated in status (size match signals whether allocation succeeded or slice is full).
+// 2. no orphan allocation.
+// (Detailed O(N^2) semantic invariant checks live in ValidatingAdmissionPolicy so they run once on commit
+// rather than being re-evaluated on every internal GuaranteedUpdate CAS retry).
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || (has(self.status) && has(self.status.allocation) && size(self.status.allocation) == size(self.spec.request))",message="every spec.request must be allocated in status (the slice may be full)"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || size(self.status.allocation) <= (has(self.spec.request) ? size(self.spec.request) : 0)",message="status.allocation has an entry with no matching spec.request"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.offset >= 0 && a.offset < 64)",message="an allocated offset is outside the slice range"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, size(self.status.allocation.filter(x, x.offset == a.offset)) == 1)",message="duplicate offset in status.allocation"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o, !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName)) || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName == o.requestName && a.offset == o.offset)))",message="an existing allocation offset cannot change (only released by removing its request)"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, !has(r.offset) || r.offset + r.length <= 64)",message="a request's offset window must fit inside the slice (offset + length <= 64)"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, self.spec.request.exists(r, r.name == a.requestName && (!has(r.offset) || (a.offset >= r.offset && a.offset < r.offset + r.length))))",message="an allocated offset is outside its request's window"
 
 // IPSlice describes a slice of IP addresses.
 type IPSlice struct {
@@ -105,17 +106,17 @@ type IPSliceSpec struct {
 	// root rules), and MaxItems on the lists.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sliceSubnet is immutable; create a new IPSlice for a different block"
-	// +kubebuilder:validation:XValidation:rule="isIP(self.prefix)",message="sliceSubnet.prefix must be a valid IP address"
-	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip.isCanonical(self.prefix)",message="sliceSubnet.prefix must be in canonical form (e.g. lowercase, compressed IPv6)"
-	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || ip(self.prefix).family() == (self.family == 'IPv4' ? 4 : 6)",message="sliceSubnet.prefix family must match sliceSubnet.family"
-	// +kubebuilder:validation:XValidation:rule="self.family == 'IPv4' ? self.prefixLength == 26 : self.prefixLength == 122",message="slice size is fixed: prefixLength must be 26 for IPv4 or 122 for IPv6 (both are 64 addresses)"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != null || isIP(self.prefix)",message="sliceSubnet.prefix must be a valid IP address"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || ip.isCanonical(self.prefix)",message="sliceSubnet.prefix must be in canonical form (e.g. lowercase, compressed IPv6)"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || ip(self.prefix).family() == (self.family == 'IPv4' ? 4 : 6)",message="sliceSubnet.prefix family must match sliceSubnet.family"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != null || (self.family == 'IPv4' ? self.prefixLength == 26 : self.prefixLength == 122)",message="slice size is fixed: prefixLength must be 26 for IPv4 or 122 for IPv6 (both are 64 addresses)"
 	// The prefix length is a family-branched string LITERAL ('/26' or '/122'), not
 	// string(self.prefixLength): the CRD's static cost estimator sizes string(int)
 	// by the integer's max magnitude, which inflates the concatenated CIDR string
 	// and pushes this rule >100x over budget. prefixLength is already pinned per
 	// family (rule above), so the literal is exact and keeps the check in the CRD
 	// (where it always runs and can't be unbound) instead of a VAP.
-	// +kubebuilder:validation:XValidation:rule="!isIP(self.prefix) || string(cidr(self.prefix + (self.family == 'IPv4' ? '/26' : '/122')).masked().ip()) == self.prefix",message="sliceSubnet.prefix must be the network address (host bits zero) aligned to prefixLength"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != null || !isIP(self.prefix) || string(cidr(self.prefix + (self.family == 'IPv4' ? '/26' : '/122')).masked().ip()) == self.prefix",message="sliceSubnet.prefix must be the network address (host bits zero) aligned to prefixLength"
 	SliceSubnet Subnet `json:"sliceSubnet"`
 }
 
@@ -168,9 +169,7 @@ type PodNetworkRef struct {
 // in size, and fit inside the slice (checked by the root rules). Offsets are
 // family-agnostic small integers, so this works identically for IPv4 and IPv6.
 //
-// +kubebuilder:validation:XValidation:rule="has(self.offset) == has(self.length)",message="offset and length must be set together (a request's window), or both omitted (allocate from anywhere in the slice)"
-// +kubebuilder:validation:XValidation:rule="!has(self.offset) || self.offset % self.length == 0",message="a request's offset must be aligned to its length (a multiple of the window size)"
-// +kubebuilder:validation:XValidation:rule="!has(self.length) || (self.length == 1 || self.length == 2 || self.length == 4 || self.length == 8 || self.length == 16 || self.length == 32 || self.length == 64)",message="a request's length must be a power of two (1, 2, 4, 8, 16, 32 or 64)"
+// +kubebuilder:validation:XValidation:rule="(!has(self.offset) && !has(self.length)) || (has(self.offset) && has(self.length) && self.offset % self.length == 0 && (self.length == 1 || self.length == 2 || self.length == 4 || self.length == 8 || self.length == 16 || self.length == 32 || self.length == 64))",message="a request's window must specify offset and power-of-two length (1, 2, 4, 8, 16, 32 or 64) with aligned offset, or omit both"
 type Request struct {
 	// Name identifies the request.
 	// +required

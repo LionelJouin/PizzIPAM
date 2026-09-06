@@ -146,17 +146,14 @@ spec:
                   - name
                   type: object
                   x-kubernetes-validations:
-                  - message: offset and length must be set together (a request's window),
-                      or both omitted (allocate from anywhere in the slice)
-                    rule: has(self.offset) == has(self.length)
-                  - message: a request's offset must be aligned to its length (a multiple
-                      of the window size)
-                    rule: '!has(self.offset) || self.offset % self.length == 0'
-                  - message: a request's length must be a power of two (1, 2, 4, 8,
-                      16, 32 or 64)
-                    rule: '!has(self.length) || (self.length == 1 || self.length ==
-                      2 || self.length == 4 || self.length == 8 || self.length ==
-                      16 || self.length == 32 || self.length == 64)'
+                  - message: a request's window must specify offset and power-of-two
+                      length (1, 2, 4, 8, 16, 32 or 64) with aligned offset, or omit
+                      both
+                    rule: (!has(self.offset) && !has(self.length)) || (has(self.offset)
+                      && has(self.length) && self.offset % self.length == 0 && (self.length
+                      == 1 || self.length == 2 || self.length == 4 || self.length
+                      == 8 || self.length == 16 || self.length == 32 || self.length
+                      == 64))
                 maxItems: 64
                 type: array
                 x-kubernetes-list-map-keys:
@@ -226,21 +223,22 @@ spec:
                     block
                   rule: self == oldSelf
                 - message: sliceSubnet.prefix must be a valid IP address
-                  rule: isIP(self.prefix)
+                  rule: oldSelf != null || isIP(self.prefix)
                 - message: sliceSubnet.prefix must be in canonical form (e.g. lowercase,
                     compressed IPv6)
-                  rule: '!isIP(self.prefix) || ip.isCanonical(self.prefix)'
+                  rule: oldSelf != null || !isIP(self.prefix) || ip.isCanonical(self.prefix)
                 - message: sliceSubnet.prefix family must match sliceSubnet.family
-                  rule: '!isIP(self.prefix) || ip(self.prefix).family() == (self.family
-                    == ''IPv4'' ? 4 : 6)'
+                  rule: 'oldSelf != null || !isIP(self.prefix) || ip(self.prefix).family()
+                    == (self.family == ''IPv4'' ? 4 : 6)'
                 - message: 'slice size is fixed: prefixLength must be 26 for IPv4
                     or 122 for IPv6 (both are 64 addresses)'
-                  rule: 'self.family == ''IPv4'' ? self.prefixLength == 26 : self.prefixLength
-                    == 122'
+                  rule: 'oldSelf != null || (self.family == ''IPv4'' ? self.prefixLength
+                    == 26 : self.prefixLength == 122)'
                 - message: sliceSubnet.prefix must be the network address (host bits
                     zero) aligned to prefixLength
-                  rule: '!isIP(self.prefix) || string(cidr(self.prefix + (self.family
-                    == ''IPv4'' ? ''/26'' : ''/122'')).masked().ip()) == self.prefix'
+                  rule: 'oldSelf != null || !isIP(self.prefix) || string(cidr(self.prefix
+                    + (self.family == ''IPv4'' ? ''/26'' : ''/122'')).masked().ip())
+                    == self.prefix'
             required:
             - podNetworkRef
             - sliceSubnet
@@ -289,34 +287,20 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: every spec.request must be allocated in status (add new requests
-            one at a time, or the slice is full)
-          rule: '!has(self.spec.request) || self.spec.request.all(r, has(self.status)
-            && has(self.status.allocation) && self.status.allocation.exists(a, a.requestName
-            == r.name))'
+        - message: every spec.request must be allocated in status (the slice may be
+            full)
+          rule: '!has(self.spec.request) || (has(self.status) && has(self.status.allocation)
+            && size(self.status.allocation) == size(self.spec.request))'
         - message: status.allocation has an entry with no matching spec.request
-          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            has(self.spec.request) && self.spec.request.exists(r, r.name == a.requestName))'
+          rule: '!has(self.status) || !has(self.status.allocation) || size(self.status.allocation)
+            <= (has(self.spec.request) ? size(self.spec.request) : 0)'
         - message: an allocated offset is outside the slice range
           rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
             a.offset >= 0 && a.offset < 64)'
-        - message: duplicate offset in status.allocation
-          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            size(self.status.allocation.filter(x, x.offset == a.offset)) == 1)'
-        - message: an existing allocation offset cannot change (only released by removing
-            its request)
-          rule: '!has(oldSelf.status) || !has(oldSelf.status.allocation) || oldSelf.status.allocation.all(o,
-            !(has(self.spec.request) && self.spec.request.exists(r, r.name == o.requestName))
-            || (has(self.status) && has(self.status.allocation) && self.status.allocation.exists(a,
-            a.requestName == o.requestName && a.offset == o.offset)))'
         - message: a request's offset window must fit inside the slice (offset + length
             <= 64)
           rule: '!has(self.spec.request) || self.spec.request.all(r, !has(r.offset)
             || r.offset + r.length <= 64)'
-        - message: an allocated offset is outside its request's window
-          rule: '!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a,
-            self.spec.request.exists(r, r.name == a.requestName && (!has(r.offset)
-            || (a.offset >= r.offset && a.offset < r.offset + r.length))))'
     served: true
     storage: true
     subresources: {}

@@ -100,7 +100,7 @@ func isSliceFull(err error) bool {
 // a lockstep herd. It is not the governor of how long Allocate keeps trying --
 // the caller's context deadline is (see isRetryable) -- but it caps the attempts
 // and spaces them so retries don't all re-collide at once.
-var retryBackoff = wait.Backoff{Steps: 100, Duration: 2 * time.Millisecond, Factor: 1.4, Jitter: 1.0, Cap: 100 * time.Millisecond}
+var retryBackoff = wait.Backoff{Steps: 60, Duration: 25 * time.Millisecond, Factor: 1.3, Jitter: 1.0, Cap: 1500 * time.Millisecond}
 
 // isRetryable reports whether a failed apply is worth retrying with the same
 // (idempotent) request. It covers the two ways a write to a hotly-contended
@@ -279,18 +279,69 @@ func Allocate(
 	}
 	numSlices := uint64(1) << uint(shift) //nolint:gosec // shift <= 32
 
-	for _, i := range opt.visitOrder(numSlices) {
-		slice := netip.PrefixFrom(addAddr(base, i*sliceHosts), sliceBits)
-		got, err := allocateSlice(ctx, client, networkRef, slice, requestName, opt.retry)
-		if err == nil {
-			return got, nil
-		}
-		if errors.Is(err, ErrSliceFull) {
-			continue // this slice is full; try the next one
-		}
-		return netip.Addr{}, err
+	fullSlices := make(map[uint64]bool)
+	outerBackoff := wait.Backoff{
+		Steps:    100,
+		Duration: 10 * time.Millisecond,
+		Factor:   1.3,
+		Jitter:   1.0,
+		Cap:      100 * time.Millisecond,
 	}
-	return netip.Addr{}, fmt.Errorf("%w: no free address in subnet %s", ErrSliceFull, subnet)
+
+	var sliceBackoff wait.Backoff
+	if !opt.retry {
+		sliceBackoff = wait.Backoff{Steps: 1}
+	} else if numSlices == 1 {
+		sliceBackoff = retryBackoff
+	} else {
+		// Multi-slice: try 2 times locally on this slice before hopping.
+		sliceBackoff = wait.Backoff{Steps: 2, Duration: 5 * time.Millisecond, Factor: 1.5, Jitter: 1.0, Cap: 15 * time.Millisecond}
+	}
+
+	for {
+		var lastRetryableErr error
+		allRemainingFull := true
+
+		for _, i := range opt.visitOrder(numSlices) {
+			if fullSlices[i] {
+				continue
+			}
+			allRemainingFull = false
+
+			slice := netip.PrefixFrom(addAddr(base, i*sliceHosts), sliceBits)
+			got, err := allocateSlice(ctx, client, networkRef, slice, requestName, sliceBackoff)
+			if err == nil {
+				return got, nil
+			}
+			if errors.Is(err, ErrSliceFull) {
+				fullSlices[i] = true
+				continue // this slice is full; try the next one
+			}
+			if isRetryable(err) {
+				lastRetryableErr = err
+				// In a multi-slice subnet, hop to another slice rather than dogpiling.
+				continue
+			}
+			return netip.Addr{}, err
+		}
+
+		if allRemainingFull || len(fullSlices) == int(numSlices) {
+			return netip.Addr{}, fmt.Errorf("%w: no free address in subnet %s", ErrSliceFull, subnet)
+		}
+
+		if !opt.retry {
+			if lastRetryableErr != nil {
+				return netip.Addr{}, lastRetryableErr
+			}
+			return netip.Addr{}, fmt.Errorf("%w: no free address in subnet %s", ErrSliceFull, subnet)
+		}
+
+		select {
+		case <-ctx.Done():
+			return netip.Addr{}, ctx.Err()
+		case <-time.After(outerBackoff.Step()):
+		}
+	}
 }
 
 // allocateSlice performs the single self-describing round-trip against one
@@ -302,9 +353,8 @@ func allocateSlice(
 	networkRef *v1alpha1.PodNetworkRef,
 	slice netip.Prefix,
 	requestName string,
-	retryTransient bool,
+	backoff wait.Backoff,
 ) (netip.Addr, error) {
-	// The prefix is the slice's network address; the concrete IP is prefix+offset.
 	prefix := slice.Addr()
 	family := "IPv4"
 	if !prefix.Is4() {
@@ -343,8 +393,8 @@ func allocateSlice(
 		)
 		return applyErr
 	}
-	if retryTransient {
-		err = retry.OnError(retryBackoff, isRetryable, apply)
+	if backoff.Steps > 1 {
+		err = retry.OnError(backoff, isRetryable, apply)
 	} else {
 		err = apply()
 	}
