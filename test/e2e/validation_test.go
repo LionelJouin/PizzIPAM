@@ -127,6 +127,10 @@ var _ = Describe("IPSlice validation", func() {
 			o.Spec.SliceSubnet.Prefix = "FE80::" // uppercase -> not canonical
 			o.Name = naming.Name(o.Spec)         // naming canonicalizes, so isCanonical is the rule that fails
 		}),
+		Entry("an uncompressed IPv6 prefix with leading zeros", func(o *v1alpha1.IPSlice) {
+			o.Spec.SliceSubnet.Prefix = "2001:0db8::" // leading zeros -> not canonical
+			o.Name = naming.Name(o.Spec)              // naming canonicalizes to 2001:db8:: so only isCanonical fails
+		}),
 		Entry("an IPv6 prefix that is not aligned to /122", func(o *v1alpha1.IPSlice) {
 			// fe80::20 has host bits set (offset 32 within the /122 block); the
 			// /122 network of fe80::20 is fe80::, so the prefix is not aligned.

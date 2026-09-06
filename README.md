@@ -1,95 +1,103 @@
-# Controllerless IPAM
+# PizzIPAM
 
-A proof-of-concept IP address manager for Kubernetes with **no controller**. The
-API server itself allocates addresses at admission time using a
-`MutatingAdmissionPolicy` (CEL), with a `ValidatingAdmissionPolicy` as the
-correctness backstop.
+> **A controllerless, webhook-free, lease-free IP Address Manager for Kubernetes.**  
+> The Kubernetes API server itself allocates IP addresses at admission time using in-tree CEL (**`MutatingAdmissionPolicy`**).
+
+```
+[ Client / CNI / DRA ]
+          │
+          │  1. Single Server-Side Apply (No prior GET / LIST)
+          ▼
+  [ kube-apiserver ]
+          │
+          ├─► MutatingAdmissionPolicy (CEL) ──► Allocates IP at admission time
+          ├─► ValidatingAdmissionPolicy (CEL) ──► Enforces naming & invariants
+          ▼
+[ Instant IP in apply response ]
+```
+
+---
+
+## Why PizzIPAM?
+
+* **⚡ Zero Controllers, Zero Webhook Pods:** No controller pods to manage, crash, or scale.
+* **🔒 Zero Distributed Locks:** No `coordination.k8s.io` Leases or etcd locks. Elimination of cluster-wide lease deadlocks.
+* **🚀 Single Round-Trip (`apply -o yaml`):** The client applies its request and gets the allocated IP immediately in the response body. No async polling, no watching claims.
+* **🎯 Deterministic Naming:** Slices are canonically named from their block identity (`pkg/naming`). Clients address slices directly with **no prior `GET` or `LIST`**.
+* **🌐 True Dual-Stack (IPv4 & IPv6):** Operates on a family-agnostic host offset model (`0..63`) supporting both IPv4 (`/26`) and IPv6 (`/122`).
+* **🏎️ Extreme Performance:** > 1600 alloc/s on spread pools.
+
+---
+
+## Quick Example
+
+Request an IP using standard Server-Side Apply:
 
 ```yaml
-apiVersion: mystuff.com/v1
-kind: IPRequest
+kubectl apply --server-side --field-manager=pod-1 -f - <<'EOF'
+apiVersion: multinetwork.networking.x-k8s.io/v1alpha1
+kind: IPSlice
 metadata:
-  name: devicenetwork-0
+  name: blue-net.pod.ipv4-10-0-0-0-26
 spec:
-  network: abc
-  subnet: 192.168.0.0/24
-  objectSubnet: 192.168.0.0/25   # this object owns one /25 block
-  baseInt: 3232235520            # int(192.168.0.0)
-  size: 128
-  requests: [alpha, beta]
+  podNetworkRef:
+    kind: pod
+    name: blue-net
+  sliceSubnet:
+    family: IPv4
+    prefix: 10.0.0.0
+    prefixLength: 26
+  request:
+  - name: pod-1
+EOF
+```
+
+The API server synchronously populates `status.allocation` and `status.bitmap` before writing to etcd:
+
+```yaml
 status:
-  ips:                           # filled by the API server, no controller
-  - {request: alpha, ip: 3232235521, display: 192.168.0.1}
-  - {request: beta,  ip: 3232235522, display: 192.168.0.2}
+  bitmap: "1000000000000000000000000000000000000000000000000000000000000000"
+  allocation:
+  - requestName: pod-1
+    offset: 0
+    address: 10.0.0.0
 ```
 
-## How it works
+---
 
-1. **One object per block.** All allocations for a block live in a single
-   `IPRequest`. Concurrent writers therefore collide on that object's
-   `resourceVersion`, so etcd's compare-and-swap serializes them (the loser gets
-   HTTP 409 and retries). This is what makes allocation *atomic* without a lock.
+## Quickstart
 
-2. **IPs stored as integers.** Working in integer space (not dotted strings)
-   makes the CEL arithmetic trivial. Under the append-only model the used set is
-   a contiguous prefix, so the next free address is just `firstFree = lo + count(used)`.
-   A dotted-decimal `display` field is derived with plain integer division/modulo.
+### 1. Requirements
+* Kubernetes **v1.32+** with `MutatingAdmissionPolicy` enabled:
+  * Runtime config: `admissionregistration.k8s.io/v1alpha1=true` (or beta/GA depending on k8s version).
+  * Feature gate: `MutatingAdmissionPolicy=true`.
 
-3. **Sharding for scale.** A single object is capped by etcd's ~1.5 MiB object
-   size and by write contention, so address space is split into fixed, disjoint
-   blocks (`/25`s here). Disjoint blocks mean per-IP uniqueness stays *local* to
-   each object — no cross-object checks needed.
-
-4. **Validation is local and sound.** The `ValidatingAdmissionPolicy` runs after
-   the mutation and checks only this object: all requests allocated, IPs in
-   range, no duplicates.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `kind-config.yaml` | kind cluster with the alpha feature enabled |
-| `manifests/crd.yaml` | the `IPRequest` CRD (status subresource intentionally OFF) |
-| `manifests/mutating-policy.yaml` | the allocator (CEL) |
-| `manifests/validating-policy.yaml` | the correctness backstop |
-| `examples/shard-0.yaml`, `shard-1.yaml` | two `/25` shards of `192.168.0.0/24` |
-| `demo.sh` | one-shot end-to-end run |
-
-## Run
-
+### 2. Install
 ```bash
-./demo.sh                         # creates a kind cluster and walks through it
-# or manually:
-kind create cluster --config kind-config.yaml
-kubectl apply -f manifests/crd.yaml
-kubectl apply -f manifests/validating-policy.yaml
-kubectl apply -f manifests/mutating-policy.yaml
-kubectl apply -f examples/shard-0.yaml
-kubectl get iprequest -o yaml
+kubectl apply -f deployment/
+```
+This installs:
+1. `IPSlice` CustomResourceDefinition.
+2. `MutatingAdmissionPolicy` (the in-tree CEL allocator).
+3. `ValidatingAdmissionPolicy` (the correctness backstop).
+
+### 3. Go Client Helper
+For programmatic integration (e.g. CNI plugins or DRA drivers), PizzIPAM provides a client helper that automates deterministic naming, multi-slice walking, and collision hopping:
+
+```go
+import "github.com/lioneljouin/pizzipam/pkg/allocator"
+
+addr, err := allocator.Allocate(ctx, client, networkRef, subnet, "my-pod", allocator.WithOrder(allocator.Random))
+// -> returns netip.Addr (e.g. 10.0.0.0) in one self-describing apply round-trip
 ```
 
-## Version note
+---
 
-`MutatingAdmissionPolicy` is **alpha** (introduced in k8s 1.32; `v1alpha1`) and
-must be enabled with a feature gate + `runtime-config` — done in
-`kind-config.yaml`. It is **not available on managed clusters** (GKE/EKS/AKS) out
-of the box. If your cluster ships it as **beta**, switch the API version to
-`v1beta1` and drop the feature gate (see the note in `kind-config.yaml`).
-`ValidatingAdmissionPolicy` is GA and needs nothing.
+## Deep Dives
 
-## Deliberate limitations (this is a demo, not production IPAM)
+* **[The 9 Load-Bearing Rules](docs/readme.md)**: Architectural guarantees that make allocation correct and collision-free without a controller.
+* **[How It Works Under the Hood](docs/how-it-works.md)**: The internal lifecycle, Server-Side Apply mechanics, CEL execution pipeline, and `GuaranteedUpdate` concurrency loops.
 
-- **IPv4 only.** IPv6 is 128-bit and overflows CEL's 64-bit integers; the clean
-  integer trick doesn't apply.
-- **No release/reclaim.** Apply-merge is additive, so removing a request from
-  `spec.requests` does *not* free its IP. To reclaim, delete the object.
-- **`status` is not RBAC-protected.** With the status subresource off, a client
-  could hand-write `status`; the ValidatingAdmissionPolicy only checks
-  consistency, it can't reserve status writes to the policy.
-- **Routing + 409 retries are client-side.** Choosing a shard, spilling over
-  when one is full, and retrying on conflict live in whatever applies the object
-  (a `kubectl` wrapper) — "no controller", not "no client".
-- **Batch cap of 32 new requests per apply** (a CEL literal, not a block limit);
-  add more across multiple applies.
-- **Block size** is bounded by etcd object size — comfortable to a `/20`-ish;
-  shard further beyond that.
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.

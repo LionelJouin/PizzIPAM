@@ -71,6 +71,14 @@ func TestName(t *testing.T) {
 			},
 			want: "abc.blue-network.ipv6-fe80---122",
 		},
+		{
+			name: "IPv6, leading zeros and uncompressed zeros canonicalize to identical name",
+			spec: v1alpha1.IPSliceSpec{
+				PodNetworkRef: v1alpha1.PodNetworkRef{Name: "abc", Kind: "blue-network"},
+				SliceSubnet:   v1alpha1.Subnet{Family: "IPv6", Prefix: "2001:0db8:0000:0000:0000:ff00:0042:8300", PrefixLength: 122},
+			},
+			want: "abc.blue-network.ipv6-2001-db8--ff00-42-8300-122",
+		},
 	}
 
 	for _, tt := range tests {
