@@ -74,6 +74,21 @@ var _ = Describe("IPSlice validation", func() {
 		Expect(err.Error()).To(ContainSubstring("at most one request may be removed in a single write"))
 	})
 
+	It("rejects changing or clearing spec.node while requests still exist", func(ctx SpecContext) {
+		By("creating a slice with spec.node and one request")
+		var err error
+		obj := newSlice(v1alpha1.Request{Name: "a", Node: strPtr("worker-1")})
+		obj.Spec.Node = strPtr("worker-1")
+		created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx, obj, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("attempting to clear spec.node while request 'a' is still present")
+		created.Spec.Node = nil
+		_, err = client.MultinetworkV1alpha1().IPSlices().Update(ctx, created, metav1.UpdateOptions{})
+		Expect(err).To(HaveOccurred(), "clearing spec.node while requests exist must be denied by VAP")
+		Expect(err.Error()).To(ContainSubstring("spec.node cannot be changed while requests still exist in the slice"))
+	})
+
 	DescribeTable("rejects an invalid IPSlice at admission (create)",
 		func(ctx SpecContext, corrupt func(*v1alpha1.IPSlice)) {
 			obj := newSlice(v1alpha1.Request{Name: "alpha"})
@@ -113,6 +128,21 @@ var _ = Describe("IPSlice validation", func() {
 			o.Spec.Request[0].Offset = i32(0)
 			o.Spec.Request[0].Length = i32(3)
 		}),
+		Entry("spec.node is set but request.node is missing", func(o *v1alpha1.IPSlice) {
+			o.Spec.Node = strPtr("worker-1")
+		}),
+		Entry("spec.node does not match request.node", func(o *v1alpha1.IPSlice) {
+			o.Spec.Node = strPtr("worker-1")
+			o.Spec.Request[0].Node = strPtr("worker-2")
+		}),
+		Entry("request.name does not match deviceRef", func(o *v1alpha1.IPSlice) {
+			o.Spec.Request[0].Name = "wrong-name"
+			o.Spec.Request[0].DeviceRef = &v1alpha1.ResourceClaimDeviceRef{
+				ClaimNamespace: "default",
+				ClaimName:      "my-claim",
+				Device:         "gpu-0",
+			}
+		}),
 	)
 
 	DescribeTable("rejects an invalid IPv6 IPSlice at admission (create)",
@@ -150,7 +180,7 @@ var _ = Describe("IPSlice validation", func() {
 			By("creating a valid, constrained slice")
 			var err error
 			created, err = client.MultinetworkV1alpha1().IPSlices().Create(ctx,
-				newSlice(v1alpha1.Request{Name: "alpha", Offset: i32(4), Length: i32(4)}),
+				newSlice(v1alpha1.Request{Name: "alpha", Offset: i32(4), Length: i32(4), Node: strPtr("worker-1")}),
 				metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -170,6 +200,9 @@ var _ = Describe("IPSlice validation", func() {
 		}),
 		Entry("a request's length", func(o *v1alpha1.IPSlice) {
 			o.Spec.Request[0].Length = i32(2) // offset 4 stays aligned to 2, so only immutability fails
+		}),
+		Entry("a request's node", func(o *v1alpha1.IPSlice) {
+			o.Spec.Request[0].Node = strPtr("different-node")
 		}),
 	)
 })

@@ -67,6 +67,14 @@ spec:
               spec is the desired state of the IPSlice.
               More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
             properties:
+              node:
+                description: |-
+                  Node identifies the Kubernetes node that currently holds ownership of this slice.
+                  When set, all requests in this slice must originate from this node.
+                  When the last request in the slice is removed, this field is cleared back to empty.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
               podNetworkRef:
                 description: |-
                   PodNetworkRef identifies the pod network that this IP slice is associated with.
@@ -112,6 +120,35 @@ spec:
                     in size, and fit inside the slice (checked by the root rules). Offsets are
                     family-agnostic small integers, so this works identically for IPv4 and IPv6.
                   properties:
+                    deviceRef:
+                      description: |-
+                        DeviceRef identifies the allocated device in a DRA ResourceClaim for this request.
+                        When set, the request name can be derived deterministically from it.
+                        Immutable once set.
+                      properties:
+                        claimName:
+                          description: ClaimName is the name of the ResourceClaim.
+                          maxLength: 253
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                        claimNamespace:
+                          description: ClaimNamespace is the namespace of the ResourceClaim.
+                          maxLength: 63
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        device:
+                          description: Device is the name of the allocated device
+                            in the ResourceClaim.
+                          maxLength: 253
+                          type: string
+                      required:
+                      - claimName
+                      - claimNamespace
+                      - device
+                      type: object
+                      x-kubernetes-validations:
+                      - message: a request's deviceRef is immutable
+                        rule: self == oldSelf
                     length:
                       description: |-
                         Length is the size of the window to allocate from (a power of two).
@@ -128,6 +165,18 @@ spec:
                       description: Name identifies the request.
                       maxLength: 63
                       type: string
+                    node:
+                      description: |-
+                        Node is the name of the Kubernetes node where the request originates.
+                        If the enclosing slice specifies spec.node, this field must match spec.node.
+                        Immutable once set.
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: a request's node is immutable; remove the request
+                          and add a new one to change its node
+                        rule: self == oldSelf
                     offset:
                       description: |-
                         Offset is the first host offset (within the slice) of the window to allocate
@@ -306,6 +355,9 @@ spec:
             <= 64)
           rule: '!has(self.spec.request) || self.spec.request.all(r, !has(r.offset)
             || r.offset + r.length <= 64)'
+        - message: every request in the slice must have node set matching spec.node
+          rule: '!has(self.spec.node) || self.spec.node == '''' || !has(self.spec.request)
+            || self.spec.request.all(r, has(r.node) && r.node == self.spec.node)'
     served: true
     storage: true
     subresources: {}

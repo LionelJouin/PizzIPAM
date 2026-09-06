@@ -162,6 +162,9 @@ spec:
             }
           }
         ]
+        + (has(object.spec.node) && size(variables.requests) == 0
+            ? [JSONPatch{ op: "remove", path: "/spec/node" }]
+            : [])
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding

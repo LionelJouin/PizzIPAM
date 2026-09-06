@@ -19,8 +19,8 @@ package allocator_test
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand/v2"
 	"net/netip"
+	"strings"
 	"testing"
 
 	v1alpha1 "github.com/lioneljouin/pizzipam/apis/v1alpha1"
@@ -167,6 +167,7 @@ func TestAllocate(t *testing.T) {
 		ref         *v1alpha1.PodNetworkRef
 		subnet      netip.Prefix
 		requestName string
+		opts        []allocator.Option
 		want        netip.Addr
 		wantErr     bool
 	}{
@@ -180,22 +181,22 @@ func TestAllocate(t *testing.T) {
 			wantErr:     false,
 		},
 		{
-			name:        "IPv4 /24",
-			client:      newFakeClient(),
-			ref:         ref,
-			subnet:      netip.MustParsePrefix("192.168.0.0/24"),
-			requestName: "test-request",
-			want:        netip.MustParseAddr("192.168.0.0"),
-			wantErr:     false,
+			name:   "IPv4 /24",
+			client: newFakeClient(),
+			ref:    ref,
+			subnet: netip.MustParsePrefix("192.168.0.0/24"),
+			opts:   []allocator.Option{allocator.WithRequest(allocator.Named("test-request").ForNode("node-0"))},
+			want:   netip.MustParseAddr("192.168.0.0"),
+			wantErr: false,
 		},
 		{
-			name:        "IPv6 /120",
-			client:      newFakeClient(),
-			ref:         ref,
-			subnet:      netip.MustParsePrefix("2001:db8::/120"),
-			requestName: "test-request",
-			want:        netip.MustParseAddr("2001:db8::"),
-			wantErr:     false,
+			name:   "IPv6 /120",
+			client: newFakeClient(),
+			ref:    ref,
+			subnet: netip.MustParsePrefix("2001:db8::/120"),
+			opts:   []allocator.Option{allocator.WithRequest(allocator.Named("test-request").ForNode("node-0"))},
+			want:   netip.MustParseAddr("2001:db8::"),
+			wantErr: false,
 		},
 		{
 			// The slice already holds an allocation at offset 0, so the new
@@ -225,13 +226,13 @@ func TestAllocate(t *testing.T) {
 			// A /25 (128 addresses, .0-.127) is larger than one slice, so Allocate
 			// walks its two /26 sub-slices (192.168.0.0/26 then 192.168.0.64/26).
 			// Both empty, so it lands in the first at offset 0.
-			name:        "IPv4 /25 walk, first sub-slice",
-			client:      newFakeClient(),
-			ref:         ref,
-			subnet:      netip.MustParsePrefix("192.168.0.0/25"),
-			requestName: "test-request",
-			want:        netip.MustParseAddr("192.168.0.0"),
-			wantErr:     false,
+			name:    "IPv4 /25 walk, first sub-slice",
+			client:  newFakeClient(),
+			ref:     ref,
+			subnet:  netip.MustParsePrefix("192.168.0.0/25"),
+			opts:    []allocator.Option{allocator.WithRequest(allocator.Named("test-request").ForNode("node-0"))},
+			want:    netip.MustParseAddr("192.168.0.0"),
+			wantErr: false,
 		},
 		{
 			// First /26 sub-slice is full, so the walk moves on and allocates
@@ -274,11 +275,11 @@ func TestAllocate(t *testing.T) {
 				fullSlice(ref, netip.MustParsePrefix("2001:db8::/122")),
 				fullSlice(ref, netip.MustParsePrefix("2001:db8::40/122")),
 			),
-			ref:         ref,
-			subnet:      netip.MustParsePrefix("2001:db8::/120"),
-			requestName: "test-request",
-			want:        netip.MustParseAddr("2001:db8::80"),
-			wantErr:     false,
+			ref:    ref,
+			subnet: netip.MustParsePrefix("2001:db8::/120"),
+			opts:   []allocator.Option{allocator.WithRequest(allocator.Named("test-request").ForNode("node-0"))},
+			want:   netip.MustParseAddr("2001:db8::80"),
+			wantErr: false,
 		},
 		{
 			// IPv6 /120 walk: first 3 are full, spills into fourth (2001:db8::c0/122).
@@ -328,17 +329,28 @@ func TestAllocate(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "empty request name",
-			client:      newFakeClient(),
-			ref:         ref,
-			subnet:      netip.MustParsePrefix("192.168.0.0/26"),
-			requestName: "",
-			wantErr:     true,
+			name:    "missing identity",
+			client:  newFakeClient(),
+			ref:     ref,
+			subnet:  netip.MustParsePrefix("192.168.0.0/26"),
+			wantErr: true,
+		},
+		{
+			name:    "empty request name",
+			client:  newFakeClient(),
+			ref:     ref,
+			subnet:  netip.MustParsePrefix("192.168.0.0/26"),
+			opts:    []allocator.Option{allocator.WithName("")},
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, gotErr := allocator.Allocate(t.Context(), tt.client, tt.ref, tt.subnet, tt.requestName)
+			opts := tt.opts
+			if len(opts) == 0 && tt.requestName != "" {
+				opts = []allocator.Option{allocator.WithName(tt.requestName)}
+			}
+			got, gotErr := allocator.Allocate(t.Context(), tt.client, tt.ref, tt.subnet, opts...)
 			if gotErr != nil {
 				if !tt.wantErr {
 					t.Errorf("Allocate() failed: %v", gotErr)
@@ -355,47 +367,60 @@ func TestAllocate(t *testing.T) {
 	}
 }
 
-// TestAllocateRandomOrder covers WithOrder(Random): it must stay correct (only
-// ever land in a real sub-slice), still spill past a full slice, and actually
-// vary which sub-slice it tries first rather than always packing the lowest one.
-func TestAllocateRandomOrder(t *testing.T) {
+// TestAllocateNodeOrder covers WithNode: it starts the walk at hash(node) % numSlices,
+// and still spills past a full slice.
+func TestAllocateNodeOrder(t *testing.T) {
 	ref := &v1alpha1.PodNetworkRef{Name: "test-network"}
 	subnet := netip.MustParsePrefix("192.168.0.0/25") // two /26 sub-slices: .0 and .64
 	first := netip.MustParseAddr("192.168.0.0")
 	second := netip.MustParseAddr("192.168.0.64")
 
-	t.Run("stays within the subnet and varies the first slice", func(t *testing.T) {
-		seen := map[netip.Addr]bool{}
-		// A range of seeds gives a deterministic, non-flaky sample of orders.
-		for seed := range uint64(32) {
-			rng := rand.New(rand.NewPCG(seed, seed)) //nolint:gosec // test-only determinism
-			got, err := allocator.Allocate(t.Context(), newFakeClient(), ref, subnet, "test-request",
-				allocator.WithOrder(allocator.Random), allocator.WithRand(rng))
-			if err != nil {
-				t.Fatalf("Allocate() failed: %v", err)
-			}
-			if got != first && got != second {
-				t.Fatalf("Allocate() = %v, want one of %v / %v", got, first, second)
-			}
-			seen[got] = true
+	t.Run("node affinity selects starting slice deterministically", func(t *testing.T) {
+		got1, err := allocator.Allocate(t.Context(), newFakeClient(), ref, subnet,
+			allocator.WithRequest(allocator.Named("req").ForNode("node-a")))
+		if err != nil {
+			t.Fatalf("Allocate() failed: %v", err)
 		}
-		if !seen[first] || !seen[second] {
-			t.Errorf("random order never varied the first slice: only saw %v", seen)
+		got2, err := allocator.Allocate(t.Context(), newFakeClient(), ref, subnet,
+			allocator.WithRequest(allocator.Named("req").ForNode("node-b")))
+		if err != nil {
+			t.Fatalf("Allocate() failed: %v", err)
+		}
+		if got1 != first && got1 != second {
+			t.Fatalf("Allocate() = %v, want one of %v / %v", got1, first, second)
+		}
+		if got2 != first && got2 != second {
+			t.Fatalf("Allocate() = %v, want one of %v / %v", got2, first, second)
 		}
 	})
 
 	t.Run("still spills past a full slice", func(t *testing.T) {
-		// The first sub-slice is full, so whatever order it tries them in, the
-		// only free address is in the second sub-slice.
 		client := newFakeClient(fullSlice(ref, netip.MustParsePrefix("192.168.0.0/26")))
-		rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // test-only determinism
-		got, err := allocator.Allocate(t.Context(), client, ref, subnet, "test-request",
-			allocator.WithOrder(allocator.Random), allocator.WithRand(rng))
+		got, err := allocator.Allocate(t.Context(), client, ref, subnet,
+			allocator.WithRequest(allocator.Named("test-request").ForNode("node-a")))
 		if err != nil {
 			t.Fatalf("Allocate() failed: %v", err)
 		}
 		if got != second {
 			t.Errorf("Allocate() = %v, want %v", got, second)
+		}
+	})
+
+	t.Run("validates node lock matches request node", func(t *testing.T) {
+		// Mismatch between request node and WithNode
+		_, err := allocator.Allocate(t.Context(), newFakeClient(), ref, subnet,
+			allocator.WithRequest(allocator.Named("req").ForNode("node-a")),
+			allocator.WithNode("node-b"))
+		if err == nil || !strings.Contains(err.Error(), "does not match") {
+			t.Fatalf("expected mismatch error, got: %v", err)
+		}
+
+		// WithNode provided but request has no node
+		_, err = allocator.Allocate(t.Context(), newFakeClient(), ref, subnet,
+			allocator.WithName("req"),
+			allocator.WithNode("node-a"))
+		if err == nil || !strings.Contains(err.Error(), "requires request node to be set") {
+			t.Fatalf("expected missing request node error, got: %v", err)
 		}
 	})
 }
@@ -432,7 +457,7 @@ func TestIPv6AddressDerivation(t *testing.T) {
 				})
 			}
 			client := newFakeClient(prefilledSlice(ref, subnet, allocations...))
-			got, err := allocator.Allocate(t.Context(), client, ref, subnet, "my-request")
+			got, err := allocator.Allocate(t.Context(), client, ref, subnet, allocator.WithName("my-request"))
 			if err != nil {
 				t.Fatalf("Allocate() failed: %v", err)
 			}
@@ -447,14 +472,14 @@ func TestRelease(t *testing.T) {
 	ref := &v1alpha1.PodNetworkRef{Name: "test-network"}
 	subnet := netip.MustParsePrefix("192.168.0.0/26")
 
-	t.Run("release with WithRequestName", func(t *testing.T) {
+	t.Run("release with WithName", func(t *testing.T) {
 		ip := netip.MustParseAddr("192.168.0.5")
 		client := newFakeClient(prefilledSlice(ref, subnet, v1alpha1.Allocation{
 			RequestName: "pod-5",
 			Offset:      5,
 		}))
 
-		err := allocator.Release(t.Context(), client, ref, ip, allocator.WithRequestName("pod-5"))
+		err := allocator.Release(t.Context(), client, ref, ip, allocator.WithName("pod-5"))
 		if err != nil {
 			t.Fatalf("Release() failed: %v", err)
 		}
@@ -482,7 +507,7 @@ func TestRelease(t *testing.T) {
 			Offset:      5,
 		}))
 
-		err := allocator.Release(t.Context(), client, v6Ref, ip, allocator.WithRequestName("v6-pod"))
+		err := allocator.Release(t.Context(), client, v6Ref, ip, allocator.WithName("v6-pod"))
 		if err != nil {
 			t.Fatalf("Release() failed: %v", err)
 		}
@@ -497,6 +522,62 @@ func TestRelease(t *testing.T) {
 		}
 		if err := allocator.Release(t.Context(), client, ref, netip.Addr{}); err == nil {
 			t.Error("Release() with invalid IP expected error")
+		}
+	})
+}
+
+func TestAllocateWithDeviceRefAndNode(t *testing.T) {
+	ref := &v1alpha1.PodNetworkRef{Name: "test-network"}
+	subnet := netip.MustParsePrefix("192.168.0.0/26")
+	devRef := v1alpha1.ResourceClaimDeviceRef{
+		ClaimNamespace: "default",
+		ClaimName:      "my-claim",
+		Device:         "net-0",
+	}
+
+	t.Run("allocates with WithDeviceRef derives request name", func(t *testing.T) {
+		client := newFakeClient()
+		got, err := allocator.Allocate(t.Context(), client, ref, subnet, allocator.WithDeviceRef(devRef))
+		if err != nil {
+			t.Fatalf("Allocate() failed: %v", err)
+		}
+		if got != netip.MustParseAddr("192.168.0.0") {
+			t.Errorf("Allocate() = %v, want 192.168.0.0", got)
+		}
+	})
+
+	t.Run("allocates with WithRequest explicit interface", func(t *testing.T) {
+		client := newFakeClient()
+		got, err := allocator.Allocate(t.Context(), client, ref, subnet, allocator.WithRequest(allocator.DeviceRef(devRef)))
+		if err != nil {
+			t.Fatalf("Allocate() failed: %v", err)
+		}
+		if got != netip.MustParseAddr("192.168.0.0") {
+			t.Errorf("Allocate() = %v, want 192.168.0.0", got)
+		}
+	})
+
+	t.Run("allocates with WithNode sets node affinity", func(t *testing.T) {
+		client := newFakeClient()
+		got, err := allocator.Allocate(t.Context(), client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-1").ForNode("worker-1")), allocator.WithNode("worker-1"))
+		if err != nil {
+			t.Fatalf("Allocate() failed: %v", err)
+		}
+		if got != netip.MustParseAddr("192.168.0.0") {
+			t.Errorf("Allocate() = %v, want 192.168.0.0", got)
+		}
+	})
+
+	t.Run("release with WithDeviceRef", func(t *testing.T) {
+		client := newFakeClient(prefilledSlice(ref, subnet, v1alpha1.Allocation{
+			RequestName: naming.RequestNameForDevice(devRef),
+			Offset:      0,
+		}))
+		ip := netip.MustParseAddr("192.168.0.0")
+		err := allocator.Release(t.Context(), client, ref, ip, allocator.WithDeviceRef(devRef))
+		if err != nil {
+			t.Fatalf("Release() failed: %v", err)
 		}
 	})
 }

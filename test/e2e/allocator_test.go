@@ -69,17 +69,20 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 		trackSubnetSlices(ref, subnet)
 
 		By("allocating the first address from the subnet")
-		addr1, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
+		addr1, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-1").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr1).To(Equal(netip.MustParseAddr("192.168.10.0")))
 
 		By("idempotently re-requesting the same name")
-		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet, "pod-1")
+		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-1").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr1Again).To(Equal(addr1), "idempotent request must return the same address")
 
 		By("allocating a second address")
-		addr2, err := allocator.Allocate(ctx, client, ref, subnet, "pod-2")
+		addr2, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-2").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr2).To(Equal(netip.MustParseAddr("192.168.10.1")))
 	})
@@ -90,23 +93,26 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 		trackSubnetSlices(ref, subnet)
 
 		By("allocating the first IPv6 address")
-		addr1, err := allocator.Allocate(ctx, client, ref, subnet, "v6-pod-1")
+		addr1, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("v6-pod-1").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr1).To(Equal(netip.MustParseAddr("2001:db8:10::")))
 
 		By("idempotently re-requesting the same IPv6 name")
-		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet, "v6-pod-1")
+		addr1Again, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("v6-pod-1").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr1Again).To(Equal(addr1), "idempotent IPv6 request must return the same address")
 
 		By("allocating a second IPv6 address")
-		addr2, err := allocator.Allocate(ctx, client, ref, subnet, "v6-pod-2")
+		addr2, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("v6-pod-2").ForNode("node-0")))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr2).To(Equal(netip.MustParseAddr("2001:db8:10::1")))
 	})
 
-	It("spreads concurrent callers across a multi-slice subnet with WithOrder(Random)", func(ctx SpecContext) {
-		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "rand-walk"}
+	It("spreads concurrent callers across a multi-slice subnet with WithNode", func(ctx SpecContext) {
+		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "node-walk"}
 		subnet := netip.MustParsePrefix("192.168.20.0/25") // two /26 sub-slices: .0 and .64
 		trackSubnetSlices(ref, subnet)
 
@@ -120,8 +126,10 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 			go func(idx int) {
 				defer wg.Done()
 				defer GinkgoRecover()
+				workerNode := fmt.Sprintf("worker-%d", idx%2)
 				addrs[idx], errs[idx] = allocator.Allocate(ctx, concurrentClient, ref, subnet,
-					fmt.Sprintf("rand-pod-%d", idx), allocator.WithOrder(allocator.Random))
+					allocator.WithRequest(allocator.Named(fmt.Sprintf("node-pod-%d", idx)).ForNode(workerNode)),
+					allocator.WithNode(workerNode))
 			}(i)
 		}
 		wg.Wait()
@@ -142,22 +150,89 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 		trackSubnetSlices(ref, subnet)
 
 		By("allocating an IP")
-		addr, err := allocator.Allocate(ctx, client, ref, subnet, "pod-rel-1")
+		addr, err := allocator.Allocate(ctx, client, ref, subnet, allocator.WithName("pod-rel-1"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addr).To(Equal(netip.MustParseAddr("192.168.50.0")))
 
-		By("releasing the IP using allocator.Release with WithRequestName (0-GET path)")
-		err = allocator.Release(ctx, client, ref, addr, allocator.WithRequestName("pod-rel-1"))
+		By("releasing the IP using allocator.Release with WithName (0-GET path)")
+		err = allocator.Release(ctx, client, ref, addr, allocator.WithName("pod-rel-1"))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("re-allocating into the freed slot")
-		addrAgain, err := allocator.Allocate(ctx, client, ref, subnet, "pod-rel-2")
+		addrAgain, err := allocator.Allocate(ctx, client, ref, subnet, allocator.WithName("pod-rel-2"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(addrAgain).To(Equal(addr), "re-allocation must claim the released offset 0")
 
 		By("releasing the IP using allocator.Release without requestName (GET lookup path)")
 		err = allocator.Release(ctx, client, ref, addrAgain)
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("allocates and releases an IP using DRA ResourceClaim DeviceRef and WithNode", func(ctx SpecContext) {
+		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "dev-node"}
+		subnet := netip.MustParsePrefix("192.168.60.0/26")
+		trackSubnetSlices(ref, subnet)
+
+		devRef := v1alpha1.ResourceClaimDeviceRef{
+			ClaimNamespace: "default",
+			ClaimName:      "dra-claim",
+			Device:         "nic-0",
+		}
+
+		By("allocating an IP with WithDeviceRef and WithNode")
+		addr, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.DeviceRef(devRef).ForNode("worker-node-1")),
+			allocator.WithNode("worker-node-1"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(addr).To(Equal(netip.MustParseAddr("192.168.60.0")))
+
+		By("verifying the object on the cluster has spec.node and matching request.node and request.deviceRef")
+		sliceName := cleanSlices[0]
+		sliceObj, err := client.MultinetworkV1alpha1().IPSlices().Get(ctx, sliceName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sliceObj.Spec.Node).NotTo(BeNil())
+		Expect(*sliceObj.Spec.Node).To(Equal("worker-node-1"))
+		Expect(sliceObj.Spec.Request).To(HaveLen(1))
+		Expect(sliceObj.Spec.Request[0].Name).To(Equal("default.dra-claim.nic-0"))
+		Expect(sliceObj.Spec.Request[0].Node).NotTo(BeNil())
+		Expect(*sliceObj.Spec.Request[0].Node).To(Equal("worker-node-1"))
+		Expect(sliceObj.Spec.Request[0].DeviceRef).To(Equal(&devRef))
+
+		By("releasing the IP using WithDeviceRef (0-GET path)")
+		err = allocator.Release(ctx, client, ref, addr, allocator.WithDeviceRef(devRef))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("verifying the slice is cleared of requests and spec.node is automatically removed")
+		sliceObj, err = client.MultinetworkV1alpha1().IPSlices().Get(ctx, sliceName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sliceObj.Spec.Request).To(BeEmpty())
+		Expect(sliceObj.Spec.Node).To(BeNil(), "spec.node must be automatically removed when the last request is deleted")
+	})
+
+	It("hops over slices locked to another node and claims an available slice", func(ctx SpecContext) {
+		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "node-hop"}
+		subnet := netip.MustParsePrefix("192.168.70.0/25") // 2 /26 slices: 192.168.70.0/26 and 192.168.70.64/26
+		trackSubnetSlices(ref, subnet)
+
+		By("allocating on the subnet with node-a")
+		addrA, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-a").ForNode("node-a")), allocator.WithNode("node-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("allocating on the subnet with node-b (forcing a hop if hashed to same slice, or claiming the other slice)")
+		addrB, err := allocator.Allocate(ctx, client, ref, subnet,
+			allocator.WithRequest(allocator.Named("pod-b").ForNode("node-b")), allocator.WithNode("node-b"))
+		Expect(err).NotTo(HaveOccurred())
+
+		pfxA, err := addrA.Prefix(26)
+		Expect(err).NotTo(HaveOccurred())
+		pfxB, err := addrB.Prefix(26)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pfxA).NotTo(Equal(pfxB), "node-a and node-b must be allocated to different slices")
+
+		By("releasing both allocations")
+		Expect(allocator.Release(ctx, client, ref, addrA, allocator.WithName("pod-a"))).To(Succeed())
+		Expect(allocator.Release(ctx, client, ref, addrB, allocator.WithName("pod-b"))).To(Succeed())
 	})
 
 	It("returns wrapped ErrSliceFull when an entire subnet is exhausted", func(ctx SpecContext) {
@@ -167,12 +242,12 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 
 		By("filling all 64 addresses in the slice")
 		for i := 0; i < int(sliceAddresses); i++ {
-			_, err := allocator.Allocate(ctx, client, ref, subnet, fmt.Sprintf("fill-%d", i))
+			_, err := allocator.Allocate(ctx, client, ref, subnet, allocator.WithName(fmt.Sprintf("fill-%d", i)))
 			Expect(err).NotTo(HaveOccurred())
 		}
 
 		By("attempting a 65th allocation must return wrapped ErrSliceFull")
-		_, err := allocator.Allocate(ctx, client, ref, subnet, "overflow-pod")
+		_, err := allocator.Allocate(ctx, client, ref, subnet, allocator.WithName("overflow-pod"))
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, allocator.ErrSliceFull)).To(BeTrue(),
 			"error must wrap allocator.ErrSliceFull, got: %v", err)
@@ -182,7 +257,7 @@ var _ = Describe("Allocator client helper (pkg/allocator)", func() {
 		ref := &v1alpha1.PodNetworkRef{Kind: "blue-network", Name: "small-test"}
 		subnet := netip.MustParsePrefix("192.168.40.0/27") // /27 is 32 addresses < 64
 
-		_, err := allocator.Allocate(ctx, client, ref, subnet, "pod-0")
+		_, err := allocator.Allocate(ctx, client, ref, subnet, allocator.WithName("pod-0"))
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("smaller than the fixed slice size"))
 	})

@@ -49,12 +49,14 @@ import (
 // expressed in slice offsets, so it cannot be disjoint from the slice.
 // 1. every request is allocated in status (size match signals whether allocation succeeded or slice is full).
 // 2. no orphan allocation.
+// 3. every request in the slice must have node set matching spec.node (when spec.node is set).
 // (Detailed O(N^2) semantic invariant checks live in ValidatingAdmissionPolicy so they run once on commit
 // rather than being re-evaluated on every internal GuaranteedUpdate CAS retry).
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || (has(self.status) && has(self.status.allocation) && size(self.status.allocation) == size(self.spec.request))",message="every spec.request must be allocated in status (the slice may be full)"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || size(self.status.allocation) <= (has(self.spec.request) ? size(self.spec.request) : 0)",message="status.allocation has an entry with no matching spec.request"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || self.status.allocation.all(a, a.offset >= 0 && a.offset < 64)",message="an allocated offset is outside the slice range"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.request) || self.spec.request.all(r, !has(r.offset) || r.offset + r.length <= 64)",message="a request's offset window must fit inside the slice (offset + length <= 64)"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.node) || self.spec.node == '' || !has(self.spec.request) || self.spec.request.all(r, has(r.node) && r.node == self.spec.node)",message="every request in the slice must have node set matching spec.node"
 
 // IPSlice describes a slice of IP addresses.
 type IPSlice struct {
@@ -77,6 +79,14 @@ type IPSliceSpec struct {
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="podNetworkRef is immutable; create a new IPSlice for a different block"
 	PodNetworkRef PodNetworkRef `json:"podNetworkRef"`
+
+	// Node identifies the Kubernetes node that currently holds ownership of this slice.
+	// When set, all requests in this slice must originate from this node.
+	// When the last request in the slice is removed, this field is cleared back to empty.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Node *string `json:"node,omitempty"`
 
 	// Request is the list of IP requests for this IP slice.
 	// +listType=map
@@ -199,6 +209,42 @@ type Request struct {
 	// +kubebuilder:validation:Maximum=64
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's length is immutable; remove the request and add a new one to change its window"
 	Length *int32 `json:"length,omitempty"`
+
+	// Node is the name of the Kubernetes node where the request originates.
+	// If the enclosing slice specifies spec.node, this field must match spec.node.
+	// Immutable once set.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's node is immutable; remove the request and add a new one to change its node"
+	Node *string `json:"node,omitempty"`
+
+	// DeviceRef identifies the allocated device in a DRA ResourceClaim for this request.
+	// When set, the request name can be derived deterministically from it.
+	// Immutable once set.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a request's deviceRef is immutable"
+	DeviceRef *ResourceClaimDeviceRef `json:"deviceRef,omitempty"`
+}
+
+// ResourceClaimDeviceRef identifies an allocated device in a DRA ResourceClaim.
+type ResourceClaimDeviceRef struct {
+	// ClaimNamespace is the namespace of the ResourceClaim.
+	// +required
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	ClaimNamespace string `json:"claimNamespace"`
+
+	// ClaimName is the name of the ResourceClaim.
+	// +required
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	ClaimName string `json:"claimName"`
+
+	// Device is the name of the allocated device in the ResourceClaim.
+	// +required
+	// +kubebuilder:validation:MaxLength=253
+	Device string `json:"device"`
 }
 
 type Allocation struct {

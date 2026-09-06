@@ -82,3 +82,8 @@ func Name(spec v1alpha1.IPSliceSpec) string {
 		sliceID,
 	)
 }
+
+// RequestNameForDevice returns a deterministic request name for a DRA ResourceClaim device.
+func RequestNameForDevice(ref v1alpha1.ResourceClaimDeviceRef) string {
+	return fmt.Sprintf("%s.%s.%s", ref.ClaimNamespace, ref.ClaimName, ref.Device)
+}

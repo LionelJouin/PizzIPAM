@@ -39,7 +39,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"net/netip"
 	"strings"
 	"time"
@@ -139,79 +138,6 @@ func isRetryable(err error) bool {
 // addresses, between two successive slice network addresses.
 const sliceHosts = 64
 
-// Order controls the order in which Allocate walks a subnet's slice-sized
-// sub-blocks when the subnet is larger than one slice. It has no effect when the
-// subnet is exactly one slice.
-type Order int
-
-const (
-	// Sequential walks the sub-slices in ascending address order (the default).
-	// It is deterministic and packs allocations into the lowest slices first,
-	// but it also makes independent callers all contend on that first slice.
-	Sequential Order = iota
-	// Random walks the sub-slices in a random order, spreading concurrent
-	// callers across the whole subnet so they do not all fill the first slice
-	// first. It still visits every sub-slice, so it only reports ErrSliceFull
-	// when the entire subnet is full.
-	Random
-)
-
-// options holds the resolved allocation options; see Option.
-type options struct {
-	order Order
-	// rng is the source used by Random order. When nil, the package-level,
-	// auto-seeded, concurrency-safe source is used; tests inject a seeded one.
-	rng *rand.Rand
-	// retry enables the transient-error retry (see isRetryable). Defaulted to
-	// true in Allocate; WithRetry(false) turns it off.
-	retry bool
-	// requestName is the field-manager / request identifier used for release.
-	requestName string
-}
-
-// Option customizes an Allocate or Release call.
-type Option func(*options)
-
-// WithOrder selects the sub-slice walk order for a subnet larger than one slice.
-// The default is Sequential.
-func WithOrder(o Order) Option { return func(op *options) { op.order = o } }
-
-// WithRand sets the random source used by Random order. It is mainly for
-// deterministic tests; production callers can leave it unset.
-func WithRand(r *rand.Rand) Option { return func(op *options) { op.rng = r } }
-
-// WithRetry toggles the transient-error retry (see isRetryable). It is ON by
-// default: Allocate retries lost optimistic-concurrency conflicts and request
-// timeouts with the idempotent apply, so a concurrent fill completes without
-// errors -- at the cost of latency (the M*S server cost is unchanged; see
-// docs/readme.md). Pass WithRetry(false) to fail fast on the first transient
-// error instead, e.g. when the caller would rather give up (or try elsewhere)
-// than wait out a saturated apiserver.
-func WithRetry(enabled bool) Option { return func(op *options) { op.retry = enabled } }
-
-// WithRequestName specifies the request name and field manager when releasing an IP.
-// When provided to Release, it enables an immediate single server-side apply round-trip
-// without needing a prior GET to discover which request owns the IP.
-func WithRequestName(name string) Option { return func(op *options) { op.requestName = name } }
-
-// visitOrder returns the sub-slice indices [0,n) in the order Allocate should
-// try them: ascending for Sequential, a random permutation for Random.
-func (o options) visitOrder(n uint64) []uint64 {
-	order := make([]uint64, n)
-	for i := range order {
-		order[i] = uint64(i)
-	}
-	if o.order == Random {
-		swap := func(i, j int) { order[i], order[j] = order[j], order[i] }
-		if o.rng != nil {
-			o.rng.Shuffle(len(order), swap)
-		} else {
-			rand.Shuffle(len(order), swap)
-		}
-	}
-	return order
-}
-
 // sliceBitsFor returns the fixed slice prefix length for prefix's family: 26 for
 // IPv4, 122 for IPv6 (both cover sliceHosts addresses).
 func sliceBitsFor(prefix netip.Addr) int {
@@ -221,24 +147,23 @@ func sliceBitsFor(prefix netip.Addr) int {
 	return 122
 }
 
-// Allocate requests a single IP address for requestName from subnet, and returns
-// the allocated address.
+// Allocate requests a single IP address from subnet for the given request,
+// and returns the allocated address.
+//
+// A request must be specified via WithRequest, WithName, or WithDeviceRef.
 //
 // The slice size is a fixed system-wide constant (a /26 for IPv4, a /122 for
 // IPv6). When subnet is exactly one slice, Allocate operates on it directly.
 // When subnet is larger, Allocate walks its slice-sized sub-blocks and allocates
-// from the FIRST one it visits with room (readme's "walking a larger subnet"),
-// so e.g. a /25 is served from either of its two /26 sub-slices. The walk order
-// is Sequential by default; pass WithOrder(Random) to spread concurrent callers
-// across the subnet instead of all contending on the lowest slice.
+// from the FIRST one it visits with room (readme's "walking a larger subnet").
+// Pass WithNode to optimize the walk for node affinity.
 //
-// It is idempotent per requestName WITHIN a single slice: calling it again with
+// It is idempotent per request name WITHIN a single slice: calling it again with
 // the same arguments returns the same address (the request entry is already
 // present, so the server keeps its existing offset -- readme rule 8). Across a
 // multi-slice subnet the walk is first-fit and does not search other slices for
 // an existing entry, so callers that rely on idempotency should pass a single
-// slice. requestName is also used as the server-side-apply field manager, so it
-// must be unique per independent caller.
+// slice.
 //
 // Errors:
 //   - ErrSliceFull (wrapped) if no slice in subnet has a free address;
@@ -250,7 +175,6 @@ func Allocate(
 	client versioned.Interface,
 	networkRef *v1alpha1.PodNetworkRef,
 	subnet netip.Prefix,
-	requestName string,
 	opts ...Option,
 ) (netip.Addr, error) {
 	opt := options{retry: true}
@@ -261,8 +185,19 @@ func Allocate(
 	if networkRef == nil {
 		return netip.Addr{}, errors.New("networkRef must not be nil")
 	}
-	if requestName == "" {
-		return netip.Addr{}, errors.New("requestName must not be empty")
+	if opt.request == nil {
+		return netip.Addr{}, errors.New("request is required (use WithRequest, WithName, or WithDeviceRef)")
+	}
+	if opt.request.RequestName() == "" {
+		return netip.Addr{}, errors.New("request name must not be empty")
+	}
+	if opt.nodeLock != "" {
+		if opt.request.Node() == "" {
+			return netip.Addr{}, fmt.Errorf("WithNode(%q) requires request node to be set", opt.nodeLock)
+		}
+		if opt.request.Node() != opt.nodeLock {
+			return netip.Addr{}, fmt.Errorf("request node %q does not match WithNode(%q)", opt.request.Node(), opt.nodeLock)
+		}
 	}
 	if !subnet.IsValid() {
 		return netip.Addr{}, fmt.Errorf("invalid subnet %q", subnet)
@@ -316,13 +251,17 @@ func Allocate(
 			allRemainingFull = false
 
 			slice := netip.PrefixFrom(addAddr(base, i*sliceHosts), sliceBits)
-			got, err := allocateSlice(ctx, client, networkRef, slice, requestName, sliceBackoff)
+			got, err := allocateSlice(ctx, client, networkRef, slice, opt.request, opt.nodeLock, sliceBackoff)
 			if err == nil {
 				return got, nil
 			}
 			if errors.Is(err, ErrSliceFull) {
 				fullSlices[i] = true
 				continue // this slice is full; try the next one
+			}
+			if isNodeMismatch(err) {
+				// Slice is claimed by another node; hop to probe next slice.
+				continue
 			}
 			if isRetryable(err) {
 				lastRetryableErr = err
@@ -354,9 +293,9 @@ func Allocate(
 // Release frees an allocated IP address from its IPSlice.
 //
 // The slice holding the address is determined deterministically from (networkRef, ip).
-// When WithRequestName("name") is provided, Release issues a single server-side apply
-// without a prior GET to remove the request under its field manager. If no request
-// name is given, Release performs a single GET to look up which request owns the
+// When a request is provided (via WithRequest, WithName, or WithDeviceRef), Release issues
+// a single server-side apply without a prior GET to remove the request under its field manager.
+// If no request is given, Release performs a single GET to look up which request owns the
 // IP's offset before releasing it.
 func Release(
 	ctx context.Context,
@@ -398,7 +337,10 @@ func Release(
 	}
 	name := naming.Name(spec)
 
-	reqName := opt.requestName
+	var reqName string
+	if opt.request != nil {
+		reqName = opt.request.RequestName()
+	}
 	if reqName == "" {
 		sliceObj, err := client.MultinetworkV1alpha1().IPSlices().Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -456,6 +398,14 @@ func offsetForAddr(prefix, addr netip.Addr) int32 {
 	return int32(addr.As16()[15] - prefix.As16()[15])
 }
 
+// isNodeMismatch reports whether err is an admission rejection indicating the slice
+// is currently owned by a different node.
+func isNodeMismatch(err error) bool {
+	return apierrors.IsInvalid(err) &&
+		(strings.Contains(err.Error(), "matching spec.node") ||
+			strings.Contains(err.Error(), "spec.node cannot be changed"))
+}
+
 // allocateSlice performs the single self-describing round-trip against one
 // slice-sized block (slice must already be masked to its network address). It is
 // the per-slice unit that Allocate's subnet walk drives.
@@ -464,7 +414,8 @@ func allocateSlice(
 	client versioned.Interface,
 	networkRef *v1alpha1.PodNetworkRef,
 	slice netip.Prefix,
-	requestName string,
+	reqSpec Request,
+	nodeLock string,
 	backoff wait.Backoff,
 ) (netip.Addr, error) {
 	prefix := slice.Addr()
@@ -473,6 +424,9 @@ func allocateSlice(
 		family = "IPv6"
 	}
 
+	var req v1alpha1.Request
+	reqSpec.ApplyToRequest(&req)
+
 	spec := v1alpha1.IPSliceSpec{
 		PodNetworkRef: *networkRef,
 		SliceSubnet: v1alpha1.Subnet{
@@ -480,7 +434,10 @@ func allocateSlice(
 			Prefix:       prefix.String(),
 			PrefixLength: int32(slice.Bits()),
 		},
-		Request: []v1alpha1.Request{{Name: requestName}},
+		Request: []v1alpha1.Request{req},
+	}
+	if nodeLock != "" {
+		spec.Node = &nodeLock
 	}
 	name := naming.Name(spec)
 
@@ -501,7 +458,7 @@ func allocateSlice(
 		var applyErr error
 		result, applyErr = client.MultinetworkV1alpha1().IPSlices().Patch(
 			ctx, name, types.ApplyPatchType, data,
-			metav1.PatchOptions{FieldManager: requestName, Force: &force},
+			metav1.PatchOptions{FieldManager: req.Name, Force: &force},
 		)
 		return applyErr
 	}
@@ -520,12 +477,12 @@ func allocateSlice(
 	// Allocation is filled synchronously at admission, so the apply response
 	// already carries our offset.
 	for _, a := range result.Status.Allocation {
-		if a.RequestName == requestName {
+		if a.RequestName == req.Name {
 			return addrForOffset(prefix, a.Offset), nil
 		}
 	}
 	return netip.Addr{}, fmt.Errorf(
-		"IPSlice %q applied but returned no allocation for request %q", name, requestName)
+		"IPSlice %q applied but returned no allocation for request %q", name, req.Name)
 }
 
 // addrForOffset returns prefix + offset, the concrete address of a slice host.

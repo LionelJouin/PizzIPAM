@@ -105,6 +105,21 @@ spec:
       size(oldObject.spec.request.filter(r, !(r.name in (has(object.spec.request) ? object.spec.request.map(x, x.name) : [])))) <= 1
     message: "at most one request may be removed in a single write"
     reason: Invalid
+  # 8. An existing slice node lock cannot be changed while requests still exist.
+  - expression: >-
+      oldObject == null || !has(oldObject.spec.node) || oldObject.spec.node == "" ||
+      !has(object.spec.request) || size(object.spec.request) == 0 ||
+      (has(object.spec.node) && object.spec.node == oldObject.spec.node)
+    message: "spec.node cannot be changed while requests still exist in the slice"
+    reason: Invalid
+  # 9. If request.deviceRef is set, request.name must match the deterministic device name.
+  - expression: >-
+      !has(object.spec.request) ||
+      object.spec.request.all(r,
+        !has(r.deviceRef) ||
+        r.name == (r.deviceRef.claimNamespace + "." + r.deviceRef.claimName + "." + r.deviceRef.device))
+    message: "request name must match deviceRef (claimNamespace.claimName.device)"
+    reason: Invalid
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

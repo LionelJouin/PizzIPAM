@@ -42,7 +42,8 @@ const (
 	offsetHi = sliceAddresses - int32(1) // last allocatable offset (broadcast included) -> 63
 )
 
-func i32(v int32) *int32 { return &v }
+func i32(v int32) *int32    { return &v }
+func strPtr(s string) *string { return &s }
 
 // v4Address mirrors the allocator's (prefix, offset) -> address render for the
 // IPv4 slice, so the test can assert the two status fields stay consistent.
